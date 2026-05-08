@@ -16,6 +16,8 @@ import java.util.stream.Collectors;
  * Thread-safe in-memory log store.
  * Backs the /logs API endpoint.
  * Capped at 2000 entries — older entries silently dropped.
+ * 
+ * Automatically captures the calling class name using stack trace analysis.
  */
 @Component
 public class LogStore {
@@ -27,13 +29,44 @@ public class LogStore {
     // Static so it survives bean re-creation during context refresh
     private static final CopyOnWriteArrayList<ObjectNode> entries = new CopyOnWriteArrayList<>();
 
+    /**
+     * Automatically detects the calling class name from the stack trace.
+     * Skips frames in LogStore and common utility classes to find the real caller.
+     */
+    private static String getCallingClassName() {
+        StackTraceElement[] stackTrace = Thread.currentThread().getStackTrace();
+        
+        // Walk the stack to find the first frame outside LogStore and common frameworks
+        for (StackTraceElement element : stackTrace) {
+            String className = element.getClassName();
+            
+            // Skip LogStore, Thread, and framework internals
+            if (className.equals("java.lang.Thread") ||
+                className.startsWith("java.lang.StackTraceElement") ||
+                className.equals("com.hacksys.backend.util.LogStore") ||
+                className.startsWith("java.") ||
+                className.startsWith("sun.")) {
+                continue;
+            }
+            
+            // Return the first real application class
+            return className;
+        }
+        
+        return "unknown";
+    }
+
     public void append(String level, String service, String traceId,
                        String errorType, String message, String className) {
         ObjectNode node = mapper.createObjectNode();
         node.put("timestamp", Instant.now().toString());
         node.put("trace_id", traceId != null ? traceId : "unknown");
         node.put("service", service != null ? service : "unknown");
-        node.put("class", className != null ? className : "unknown");
+        
+        // Use provided className if available, otherwise auto-detect
+        String resolvedClassName = (className != null) ? className : getCallingClassName();
+        node.put("class", resolvedClassName);
+        
         node.put("error_type", errorType != null ? errorType : "NONE");
         node.put("message", message);
         node.put("level", level);
@@ -61,6 +94,7 @@ public class LogStore {
     }
 
     // Convenience shorthands used by services
+    // These automatically capture the calling class name
     public void info(String service, String traceId, String message) {
         append("INFO", service, traceId, null, message, null);
     }
