@@ -325,3 +325,26 @@ public class OrderService {
         return Math.random() < failureRate;
     }
 }
+
+
+/* ===== Morphic AI suggested patch =====
+// Add state transition logic in OrderService.createOrder method
+// After inventory reservation failure, transition order to appropriate state
+
+if (!inventoryReservationSuccess) {
+    // Line 239842: Missing state transition when inventory hold fails
+    if (allowPartialReservation) {
+        order.setStatus(OrderStatus.PENDING_STOCK);
+        logStore.warn("OrderService", traceId, "ORDER_PENDING_STOCK",
+            "Order transitioned to PENDING_STOCK due to insufficient inventory orderId=" + order.getId());
+    } else {
+        order.setStatus(OrderStatus.CANCELLED);
+        logStore.warn("OrderService", traceId, "ORDER_AUTO_CANCELLED",
+            "Order auto-cancelled due to inventory failure orderId=" + order.getId());
+    }
+    orderRepository.save(order);
+} else {
+    order.setStatus(OrderStatus.CONFIRMED);
+    orderRepository.save(order);
+}
+===== end patch ===== */

@@ -426,3 +426,43 @@ public class ChaosScheduler {
         }
     }
 }
+
+/* ===== Morphic AI suggested patch =====
+// Line 82-95: Add order state validation before retry acceptance
+@Scheduled(fixedDelay = 25000, initialDelay = 8000)
+public void retryProcessor() {
+    String traceId = "retry-" + UUID.randomUUID().toString().substring(0, 8);
+    logStore.info(SVC, traceId, "retry processor: dequeuing failed submissions batch_size=1");
+    
+    try {
+        // Validate order state before retry
+        List<Order> stuckOrders = orderService.findOrdersByStatus("CREATED");
+        for (Order order : stuckOrders) {
+            if (order.hasInventoryIssues()) {
+                orderService.transitionOrderState(order.getId(), "FAILED", traceId);
+                logStore.warn(SVC, traceId, "ORDER_TRANSITION_FAILED", 
+                    "Order transitioned to FAILED due to inventory issues orderId=" + order.getId());
+                continue;
+            }
+        }
+        
+        String userId = USER_IDS[random.nextInt(USER_IDS.length)];
+        String productId = PRODUCT_IDS[random.nextInt(PRODUCT_IDS.length)];
+        int quantity = 1 + random.nextInt(3);
+        
+        List<Order.OrderItem> items = List.of(new Order.OrderItem(productId, quantity, 79.99));
+        Order order = orderService.createOrder(userId, items, traceId);
+        
+        // Only accept submission if order can transition properly
+        if (order.getStatus().equals("CREATED") && !order.hasInventoryIssues()) {
+            logStore.info(SVC, traceId, "retry processor: submission accepted");
+        } else {
+            logStore.warn(SVC, traceId, "RETRY_SUBMISSION_REJECTED", 
+                "Order submission rejected due to state validation failure orderId=" + order.getId());
+        }
+    } catch (Exception e) {
+        logStore.error(SVC, traceId, "RETRY_PROCESSOR_ERROR", 
+            "retry processor failed: " + e.getMessage());
+    }
+}
+===== end patch ===== */
