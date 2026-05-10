@@ -426,3 +426,22 @@ public class ChaosScheduler {
         }
     }
 }
+
+/* ===== Morphic AI suggested patch =====
+// Line 216: Add order state validation before payment retry
+Order order = orderService.getOrderById(orderId);
+if (order.getStatus() != Order.Status.CREATED && order.getStatus() != Order.Status.PENDING) {
+    logStore.warn(SVC, traceId, "PAYMENT_RETRY_SKIPPED",
+        "skipping payment retry for orderId=" + orderId + " status=" + order.getStatus());
+    continue;
+}
+
+// Line 217-223: Original payment processing logic
+try {
+    paymentService.processPayment(orderId, "system-retry", 79.99, traceId);
+    logStore.info(SVC, traceId, "payment retry successful orderId=" + orderId);
+} catch (RuntimeException e) {
+    logStore.error(SVC, traceId, "PAYMENT_RETRY_FAILED",
+        "payment retry failed orderId=" + orderId + " error=" + e.getMessage());
+}
+===== end patch ===== */
