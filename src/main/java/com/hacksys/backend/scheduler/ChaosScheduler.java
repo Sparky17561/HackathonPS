@@ -426,3 +426,41 @@ public class ChaosScheduler {
         }
     }
 }
+
+/* ===== Morphic AI suggested patch =====
+@Scheduled(fixedDelay = 40000, initialDelay = 4000)
+public void paymentRetryWorker() {
+    String traceId = "pay-retry-" + UUID.randomUUID().toString().substring(0, 8);
+    logStore.info(SVC, traceId, "payment retry worker: beginning retry sweep");
+
+    long now = System.currentTimeMillis();
+    List<String> toRetry = new ArrayList<>();
+    pendingReconciliation.entrySet().removeIf(entry -> {
+        long age = now - entry.getValue();
+        if (age > 45000) {
+            toRetry.add(entry.getKey());
+            return true;
+        }
+        return false;
+    });
+
+    for (String orderId : toRetry) {
+        try {
+            // Line 166-168: Added order state validation before payment retry
+            Order order = orderService.getOrderById(orderId);
+            if (order == null || !"CREATED".equals(order.getStatus()) || !order.isInventoryReserved()) {
+                logStore.warn(SVC, traceId, "RETRY_SKIPPED", 
+                    "skipping payment retry for orderId=" + orderId + " invalid state or missing inventory");
+                continue;
+            }
+            
+            logStore.info(SVC, traceId, "payment retry worker: retrying authorization orderId=" + orderId + " attempt=1");
+            double amount = 79.98 + (random.nextDouble() * 200);
+            paymentService.processPayment(orderId, "user-retry", amount, traceId);
+        } catch (RuntimeException e) {
+            logStore.error(SVC, traceId, "PAYMENT_RETRY_FAILED",
+                "payment retry failed orderId=" + orderId + " error=" + e.getMessage());
+        }
+    }
+}
+===== end patch ===== */
