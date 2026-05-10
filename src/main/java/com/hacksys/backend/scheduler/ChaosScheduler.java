@@ -426,3 +426,23 @@ public class ChaosScheduler {
         }
     }
 }
+
+/* ===== Morphic AI suggested patch =====
+if (random.nextDouble() < 0.3) {
+                try {
+                    // Line 61-66: Add state transition guard before payment processing
+                    if (order.getStatus() == Order.OrderStatus.CREATED) {
+                        paymentService.processPayment(order.getId(), userId, quantity * 79.99, traceId);
+                        // Ensure order state transitions to PAYMENT_PROCESSED after successful payment
+                        orderService.updateOrderStatus(order.getId(), Order.OrderStatus.PAYMENT_PROCESSED, traceId);
+                    } else {
+                        logStore.warn(SVC, traceId, "PAYMENT_SKIPPED_INVALID_STATE",
+                            "payment skipped for order in invalid state orderId=" + order.getId() + " status=" + order.getStatus());
+                    }
+                } catch (RuntimeException e) {
+                    String[] eCodes = {"PAYMENT_PROCESSING_ERROR", "RECON_PAY_FAIL", "PAY_CYCLE_ERR"};
+                    logStore.error(SVC, traceId, eCodes[random.nextInt(eCodes.length)],
+                        "payment processing failed orderId=" + order.getId() + " msg=" + e.getMessage());
+                }
+            }
+===== end patch ===== */
