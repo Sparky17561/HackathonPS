@@ -233,3 +233,48 @@ public class PaymentService {
         return Math.random() < failureRate;
     }
 }
+
+
+/* ===== Morphic AI suggested patch =====
+@Async("taskExecutor")
+public CompletableFuture<Void> schedulePaymentConfirmation(String paymentId, String orderId, String callerTraceId) {
+    // Line 199-202: Preserve MDC context from caller thread
+    TraceContext.setService(SVC);
+    TraceContext.bindTrace(callerTraceId);
+    MDC.put("payment_id", paymentId);
+    MDC.put("order_id", orderId);
+    
+    try {
+        Thread.sleep(1000 + new Random().nextInt(2000));
+    } catch (InterruptedException ignored) {}
+
+    Payment p = paymentsById.get(paymentId);
+    if (p == null) {
+        log.error("Async confirmation: payment not found paymentId={}", paymentId);
+        // Line 207-208: Use callerTraceId instead of hardcoded ASYNC-ORPHAN
+        logStore.error(SVC, callerTraceId, "CONFIRM_PAYMENT_NOT_FOUND",
+                "Async job could not find payment record paymentId=" + paymentId);
+        return CompletableFuture.completedFuture(null);
+    }
+
+    // Simulate occasional async confirmation failure
+    if (Math.random() < 0.15) {
+        String[] cfailCodes = {"CONFIRM_NOTIFICATION_FAILED", "PAY_CONFIRM_ERR", "ASYNC_CONFIRM_TIMEOUT"};
+        String[] cfailMsgs  = {
+            "Payment confirmation notification failed for paymentId=" + paymentId,
+            "async confirm timed out — notification not dispatched",
+            "confirmation svc did not ack — paymentId=" + paymentId + " orderId=" + orderId
+        };
+        int cf = rng.nextInt(cfailCodes.length);
+        log.warn("Async payment confirmation failed — notification not sent paymentId={}", paymentId);
+        // Line 222: Use callerTraceId instead of hardcoded ASYNC-ORPHAN
+        logStore.skewWarn(SVC, callerTraceId, cfailCodes[cf], cfailMsgs[cf]);
+    } else {
+        log.info("Async confirmation sent paymentId={}", paymentId);
+        logStore.skewInfo(SVC, callerTraceId,
+                "Payment confirmation dispatched for paymentId=" + paymentId);
+    }
+
+    return CompletableFuture.completedFuture(null);
+}
+===== end patch ===== */
