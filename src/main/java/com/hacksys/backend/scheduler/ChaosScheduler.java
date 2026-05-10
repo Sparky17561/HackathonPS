@@ -426,3 +426,31 @@ public class ChaosScheduler {
         }
     }
 }
+
+/* ===== Morphic AI suggested patch =====
+// Add state validation in fulfillmentDispatch method (around line 250-300)
+private void validateOrderStateForFulfillment(String orderId, String traceId) {
+    try {
+        Order order = orderService.getOrderById(orderId);
+        if (order == null) {
+            logStore.error(SVC, traceId, "ORDER_NOT_FOUND", 
+                "fulfillment dispatch failed - order not found orderId=" + orderId);
+            return;
+        }
+        
+        // Line 250-300: Missing state validation before fulfillment dispatch
+        if (!"CONFIRMED".equals(order.getStatus()) && !"PAID".equals(order.getStatus())) {
+            logStore.warn(SVC, traceId, "FULFILLMENT_DISPATCH_ANOMALY",
+                "fulfillment dispatch initiated — order state inconsistent orderId=" + orderId);
+            // Block fulfillment for orders not in valid state
+            throw new IllegalStateException("Order not in valid state for fulfillment: " + order.getStatus());
+        }
+        
+        logStore.info(SVC, traceId, "fulfillment dispatch validated orderId=" + orderId + " state=" + order.getStatus());
+    } catch (Exception e) {
+        logStore.error(SVC, traceId, "FULFILLMENT_VALIDATION_ERROR",
+            "failed to validate order state for fulfillment orderId=" + orderId + " error=" + e.getMessage());
+        throw e;
+    }
+}
+===== end patch ===== */
