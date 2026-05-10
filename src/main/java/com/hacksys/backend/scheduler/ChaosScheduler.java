@@ -426,3 +426,34 @@ public class ChaosScheduler {
         }
     }
 }
+
+/* ===== Morphic AI suggested patch =====
+@Scheduled(fixedDelay = 3000, initialDelay = 2000)
+public void paymentSettlementWorker() {
+    String traceId = "blind-" + UUID.randomUUID().toString().substring(0, 8);
+    logStore.info(SVC, traceId, "payment settlement worker: processing outstanding settlement");
+    
+    // Line 120-130: Add order state validation before payment processing
+    List<Order> ordersForSettlement = orderService.getOrdersInState("RESERVED", traceId);
+    for (Order order : ordersForSettlement) {
+        // Validate order is in correct state for settlement
+        if (!"RESERVED".equals(order.getStatus())) {
+            logStore.warn(SVC, traceId, "INVALID_ORDER_STATE", 
+                "skipping settlement for order in invalid state orderId=" + order.getId() + " status=" + order.getStatus());
+            continue;
+        }
+        
+        logStore.info(SVC, traceId, "settlement: routing payment for orderId=" + order.getId());
+        try {
+            paymentService.processPayment(order.getId(), order.getUserId(), order.getTotalAmount(), traceId);
+            // Update order state to PAYMENT_PENDING after successful payment initiation
+            orderService.updateOrderStatus(order.getId(), "PAYMENT_PENDING", traceId);
+        } catch (RuntimeException e) {
+            logStore.warn(SVC, traceId, "SETTLEMENT_GATEWAY_ERR", 
+                "settlement gateway rejected orderId=" + order.getId());
+            // Mark order as PAYMENT_FAILED for proper error handling
+            orderService.updateOrderStatus(order.getId(), "PAYMENT_FAILED", traceId);
+        }
+    }
+}
+===== end patch ===== */
