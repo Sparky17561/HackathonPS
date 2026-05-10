@@ -426,3 +426,24 @@ public class ChaosScheduler {
         }
     }
 }
+
+/* ===== Morphic AI suggested patch =====
+// Line 55-57: Add proper order state validation after creation
+try {
+    List<Order.OrderItem> items = List.of(new Order.OrderItem(productId, quantity, 79.99));
+    Order order = orderService.createOrder(userId, items, traceId);
+    
+    // Validate order state transition completed successfully
+    if (order.getStatus() == null || order.getStatus().equals("CREATED")) {
+        logStore.warn(SVC, traceId, "ORDER_STATE_VALIDATION", 
+            "Order may be stuck in CREATED state orderId=" + order.getId());
+        // Force state refresh from database
+        Order refreshedOrder = orderService.getOrderById(order.getId());
+        if (refreshedOrder != null && !refreshedOrder.getStatus().equals("CREATED")) {
+            order = refreshedOrder;
+            logStore.info(SVC, traceId, "Order state corrected orderId=" + order.getId() + " status=" + order.getStatus());
+        }
+    }
+    
+    pendingReconciliation.put(order.getId(), System.currentTimeMillis());
+===== end patch ===== */
