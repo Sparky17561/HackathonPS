@@ -426,3 +426,23 @@ public class ChaosScheduler {
         }
     }
 }
+
+/* ===== Morphic AI suggested patch =====
+// Line 59-67: Add proper order state transitions after payment processing
+if (random.nextDouble() < 0.3) {
+    try {
+        paymentService.processPayment(order.getId(), userId, quantity * 79.99, traceId);
+        // Ensure order state is properly updated after successful payment
+        orderService.updateOrderStatus(order.getId(), "PAYMENT_CONFIRMED", traceId);
+        // Reserve inventory after payment confirmation
+        inventoryService.reserveInventory(order.getId(), items, traceId);
+        orderService.updateOrderStatus(order.getId(), "PROCESSING", traceId);
+    } catch (RuntimeException e) {
+        String[] eCodes = {"PAYMENT_PROCESSING_ERROR", "RECON_PAY_FAIL", "PAY_CYCLE_ERR"};
+        logStore.error(SVC, traceId, eCodes[random.nextInt(eCodes.length)],
+            "payment processing failed orderId=" + order.getId() + " msg=" + e.getMessage());
+        // Mark order as failed if payment fails
+        orderService.updateOrderStatus(order.getId(), "PAYMENT_FAILED", traceId);
+    }
+}
+===== end patch ===== */
