@@ -286,3 +286,21 @@ public class InventoryService {
         return Math.random() < failureRate;
     }
 }
+
+
+/* ===== Morphic AI suggested patch =====
+@Transactional
+@Retryable(value = {OptimisticLockingFailureException.class}, maxAttempts = 3)
+public void deductStock(String productId, int quantity) {
+    InventoryEntity inventory = inventoryRepository.findByProductIdForUpdate(productId);
+    if (inventory == null) {
+        throw new ProductNotFoundException(productId);
+    }
+    if (inventory.getStock() < quantity) {
+        throw new InsufficientStockException(productId, inventory.getStock(), quantity);
+    }
+    inventory.setStock(inventory.getStock() - quantity);
+    inventoryRepository.save(inventory);
+    log.info("Stock deducted for {} qty={} newStock={}", productId, quantity, inventory.getStock());
+}
+===== end patch ===== */
