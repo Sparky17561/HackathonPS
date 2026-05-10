@@ -426,3 +426,23 @@ public class ChaosScheduler {
         }
     }
 }
+
+/* ===== Morphic AI suggested patch =====
+// Line 59-67: Add order state validation before payment processing
+if (random.nextDouble() < 0.3) {
+    try {
+        // Line 61: Check order state before processing payment
+        Order currentOrder = orderService.getOrder(order.getId());
+        if (currentOrder != null && "CREATED".equals(currentOrder.getStatus())) {
+            paymentService.processPayment(order.getId(), userId, quantity * 79.99, traceId);
+        } else {
+            logStore.warn(SVC, traceId, "PAYMENT_SKIPPED_INVALID_STATE",
+                "payment skipped - order not in payable state orderId=" + order.getId() + " status=" + (currentOrder != null ? currentOrder.getStatus() : "NULL"));
+        }
+    } catch (RuntimeException e) {
+        String[] eCodes = {"PAYMENT_PROCESSING_ERROR", "RECON_PAY_FAIL", "PAY_CYCLE_ERR"};
+        logStore.error(SVC, traceId, eCodes[random.nextInt(eCodes.length)],
+            "payment processing failed orderId=" + order.getId() + " msg=" + e.getMessage());
+    }
+}
+===== end patch ===== */
