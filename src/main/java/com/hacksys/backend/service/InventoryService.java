@@ -285,4 +285,108 @@ public class InventoryService {
     private boolean shouldFail() {
         return Math.random() < failureRate;
     }
+
+
+/**
+ * Query the reservation status for a given idempotency key.
+ * Returns a map with keys: "status" (CONFIRMED | NOT_FOUND | PENDING),
+ * and optionally "reservationId".
+ * Used by saga compensation logic to determine whether a timed-out
+ * reservation was actually applied.
+ */
+public Map<String, String> getReservationStatus(String idempotencyKey, String traceId) {
+    TraceContext.setService(SVC);
+    TraceContext.bindTrace(traceId);
+
+    log.info("getReservationStatus idempotencyKey={}", idempotencyKey);
+    logStore.info(SVC, traceId,
+        "getReservationStatus: querying reservation for idempotencyKey=" + idempotencyKey);
+
+    if (idempotencyKey == null || idempotencyKey.isBlank()) {
+        logStore.warn(SVC, traceId, "IDEMPOTENCY_KEY_MISSING",
+            "getReservationStatus: idempotency key is null or blank");
+        Map<String, String> result = new HashMap<>();
+        result.put("status", "NOT_FOUND");
+        return result;
+    }
+
+    // Check local idempotency table (in-memory store keyed by idempotency key)
+    Map<String, String> record = idempotencyTable.get(idempotencyKey);
+    if (record != null) {
+        String status = record.getOrDefault("status", "NOT_FOUND");
+        log.info("getReservationStatus: found local record idempotencyKey={} status={}",
+            idempotencyKey, status);
+        logStore.info(SVC, traceId,
+            "getReservationStatus: local record found idempotencyKey=" + idempotencyKey
+            + " status=" + status);
+        return Collections.unmodifiableMap(record);
+    }
+
+    // No local record â€” treat as NOT_FOUND (reservation was never committed)
+    log.info("getReservationStatus: no record found for idempotencyKey={}", idempotencyKey);
+    logStore.info(SVC, traceId,
+        "getReservationStatus: no record found idempotencyKey=" + idempotencyKey
+        + " returning NOT_FOUND");
+    Map<String, String> notFound = new HashMap<>();
+    notFound.put("status", "NOT_FOUND");
+    return Collections.unmodifiableMap(notFound);
+}
+
+/**
+ * Reserve stock with idempotency key support.
+ * Records the reservation attempt in the local idempotency table before
+ * executing, so that duplicate calls return the original result.
+ */
+public boolean reserveStockIdempotent(String productId, int quantity,
+                                      String idempotencyKey, String traceId) {
+    TraceContext.setService(SVC);
+    TraceContext.bindTrace(traceId);
+
+    log.info("reserveStockIdempotent idempotencyKey={} productId={} qty={}",
+        idempotencyKey, productId, quantity);
+    logStore.info(SVC, traceId,
+        "reserveStockIdempotent: checking idempotency table key=" + idempotencyKey);
+
+    // Check idempotency table first
+    Map<String, String> existing = idempotencyTable.get(idempotencyKey);
+    if (existing != null) {
+        String status = existing.getOrDefault("status", "NOT_FOUND");
+        logStore.info(SVC, traceId,
+            "reserveStockIdempotent: duplicate call detected key=" + idempotencyKey
+            + " returning cached status=" + status);
+        return "CONFIRMED".equals(status);
+    }
+
+    // Record PENDING before outbound call
+    Map<String, String> pendingRecord = new HashMap<>();
+    pendingRecord.put("status", "PENDING");
+    pendingRecord.put("productId", productId);
+    pendingRecord.put("quantity", String.valueOf(quantity));
+    pendingRecord.put("traceId", traceId);
+    pendingRecord.put("createdAt", String.valueOf(System.currentTimeMillis()));
+    idempotencyTable.put(idempotencyKey, pendingRecord);
+
+    try {
+        boolean result = reserveStock(productId, quantity, traceId);
+        // Update idempotency table with final status
+        Map<String, String> finalRecord = new HashMap<>(pendingRecord);
+        finalRecord.put("status", result ? "CONFIRMED" : "FAILED");
+        finalRecord.put("reservationId", idempotencyKey + "-res");
+        idempotencyTable.put(idempotencyKey, finalRecord);
+        logStore.info(SVC, traceId,
+            "reserveStockIdempotent: recorded result key=" + idempotencyKey
+            + " status=" + finalRecord.get("status"));
+        return result;
+    } catch (RuntimeException e) {
+        // Leave as PENDING so compensation can query and resolve
+        logStore.warn(SVC, traceId, "INV_TIMEOUT",
+            "reserveStockIdempotent: reservation threw exception key=" + idempotencyKey
+            + " leaving status=PENDING for compensation: " + e.getMessage());
+        throw e;
+    }
+}
+
+// Local idempotency table: idempotencyKey -> {status, reservationId, ...}
+private final ConcurrentHashMap<String, Map<String, String>> idempotencyTable =
+    new ConcurrentHashMap<>();
 }
