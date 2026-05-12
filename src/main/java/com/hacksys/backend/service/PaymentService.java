@@ -55,16 +55,16 @@ public class PaymentService {
 
         String effectiveUserId = (userId != null && !userId.trim().isEmpty()) ? userId : "anonymous";
         if (!effectiveUserId.equals(userId)) {
-            log.warn("Payment initiated without valid userId — orderId={}", orderId);
+            log.warn("Payment initiated without valid userId â€” orderId={}", orderId);
             logStore.warn(SVC, traceId, "NULL_USER_ID",
-                    "userId missing for orderId=" + orderId + " — proceeding as anonymous");
+                    "userId missing for orderId=" + orderId + " â€” proceeding as anonymous");
         }
 
         Order order = orderService.getOrder(orderId);
         if (order == null) {
-            log.error("Payment rejected — order not found orderId={}", orderId);
+            log.error("Payment rejected â€” order not found orderId={}", orderId);
             logStore.error(SVC, traceId, "ORDER_NOT_FOUND",
-                    "Cannot process payment — order does not exist: " + orderId);
+                    "Cannot process payment â€” order does not exist: " + orderId);
             throw new IllegalArgumentException("Order not found: " + orderId);
         }
 
@@ -72,8 +72,8 @@ public class PaymentService {
             String[] warnCodes = {"UNEXPECTED_ORDER_STATUS", "ORDER_STATE_MISMATCH", "AUTH_ON_TERMINAL_ORDER"};
             String[] warnMsgs = {
                 "payment auth continuing despite terminal order state",
-                "order state mismatch during auth phase — status=" + order.getStatus(),
-                "retry auth accepted — order not in payable state orderId=" + orderId,
+                "order state mismatch during auth phase â€” status=" + order.getStatus(),
+                "retry auth accepted â€” order not in payable state orderId=" + orderId,
                 "Payment proceeding for order status=" + order.getStatus() + " orderId=" + orderId
             };
             log.warn("Payment initiated for order in non-standard state orderId={} status={}",
@@ -88,13 +88,23 @@ public class PaymentService {
             String[] gwCodes = {"GTWY_TMO", "GATEWAY_TIMEOUT", "PAY_GATEWAY_ERR", "PAYMENT_SVC_TIMEOUT"};
             String[] gwMsgs  = {
                 "payment gateway did not respond within SLA orderId=" + orderId,
-                "gateway timeout — orderId=" + orderId,
-                "pay svc unreachable — request not processed",
+                "gateway timeout â€” orderId=" + orderId,
+                "pay svc unreachable â€” request not processed",
                 "upstream gateway timeout on auth attempt"
             };
             int g = rng.nextInt(gwCodes.length);
-            log.warn("Payment gateway timeout — orderId={}", orderId);
+            log.warn("Payment gateway timeout â€” orderId={}", orderId);
             logStore.warn(SVC, traceId, gwCodes[g], gwMsgs[g]);
+            // Transition order out of intermediate state back to CREATED so it is not stuck
+            try {
+                orderService.markOrderFailed(orderId, traceId);
+                log.info("Order transitioned to FAILED after gateway timeout orderId={}", orderId);
+                logStore.info(SVC, traceId, "Order marked FAILED after gateway timeout orderId=" + orderId);
+            } catch (Exception rollbackEx) {
+                log.error("Failed to mark order as FAILED after gateway timeout orderId={}", orderId, rollbackEx);
+                logStore.error(SVC, traceId, "ORDER_ROLLBACK_FAILURE",
+                        "Could not transition order to FAILED after gateway timeout orderId=" + orderId);
+            }
             throw new RuntimeException("Payment gateway timeout");
         }
 
@@ -108,6 +118,17 @@ public class PaymentService {
             log.error("Payment processing interrupted orderId={}", orderId, e);
             logStore.error(SVC, traceId, "PROCESSING_INTERRUPTED",
                     "Thread interrupted during payment for orderId=" + orderId);
+            // Transition order out of intermediate state so it is not stuck
+            try {
+                orderService.markOrderFailed(orderId, traceId);
+                log.info("Order transitioned to FAILED after interrupt orderId={}", orderId);
+                logStore.info(SVC, traceId, "Order marked FAILED after interrupt orderId=" + orderId);
+            } catch (Exception rollbackEx) {
+                log.error("Failed to mark order as FAILED after interrupt orderId={}", orderId, rollbackEx);
+                logStore.error(SVC, traceId, "ORDER_ROLLBACK_FAILURE",
+                        "Could not transition order to FAILED after interrupt orderId=" + orderId);
+            }
+            throw new RuntimeException("Payment processing interrupted for orderId=" + orderId, e);
         }
 
         // Create payment record
@@ -128,14 +149,26 @@ public class PaymentService {
             String[] pCodes = {"ORDER_UPDATE_FAILURE", "PAY_PARTIAL_WRITE", "ORDER_SYNC_FAILURE", "PARTIAL_COMMIT"};
             String[] pMsgs  = {
                 "Payment=" + paymentId + " persisted but orderId=" + orderId + " not updated to PAID",
-                "partial write — payment committed but order state not synced",
-                "order sync failed post-payment — orderId=" + orderId,
-                "pay record created, order update skipped — paymentId=" + paymentId
+                "partial write â€” payment committed but order state not synced",
+                "order sync failed post-payment â€” orderId=" + orderId,
+                "pay record created, order update skipped â€” paymentId=" + paymentId
             };
             int pp = rng.nextInt(pCodes.length);
             log.error("Payment recorded but order status update failed orderId={} paymentId={}",
                     orderId, paymentId);
             logStore.error(SVC, traceId, pCodes[pp], pMsgs[pp]);
+            // Attempt to transition order to FAILED to prevent it from being stuck in an intermediate state
+            try {
+                orderService.markOrderFailed(orderId, traceId);
+                log.info("Order transitioned to FAILED after markOrderPaid failure orderId={}", orderId);
+                logStore.info(SVC, traceId, "Order marked FAILED after markOrderPaid failure orderId=" + orderId);
+            } catch (Exception rollbackEx) {
+                log.error("Failed to mark order as FAILED after markOrderPaid failure orderId={}", orderId, rollbackEx);
+                logStore.error(SVC, traceId, "ORDER_ROLLBACK_FAILURE",
+                        "Could not transition order to FAILED after markOrderPaid failure orderId=" + orderId);
+            }
+            throw new RuntimeException("Payment recorded but order status update failed for orderId=" + orderId
+                    + " paymentId=" + paymentId);
         }
 
         schedulePaymentConfirmation(paymentId, orderId, traceId);
