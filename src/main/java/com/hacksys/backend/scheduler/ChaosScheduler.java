@@ -425,4 +425,62 @@ public class ChaosScheduler {
             }
         }
     }
+
+    // Stuck-order reconciliation job â€” force-transitions orders in non-terminal states older than STUCK_ORDER_TIMEOUT_MS to FAILED
+    private static final long STUCK_ORDER_TIMEOUT_MS = 30_000L; // 30 seconds, configurable
+
+    @Scheduled(fixedDelayString = "${order.reconcile.interval-ms:300000}", initialDelay = 15000)
+    public void reconcileStuckOrders() {
+        String traceId = "stuck-recon-" + UUID.randomUUID().toString().substring(0, 8);
+        log.info("reconcileStuckOrders: starting scan for stuck orders traceId={}", traceId);
+        logStore.info(SVC, traceId, "reconcileStuckOrders: scan started");
+
+        long now = System.currentTimeMillis();
+        int forcedCount = 0;
+
+        try {
+            Map<String, Order> allOrders = orderService.getAllOrders();
+            for (Map.Entry<String, Order> entry : allOrders.entrySet()) {
+                String orderId = entry.getKey();
+                Order order = entry.getValue();
+
+                // Only act on non-terminal, intermediate states
+                Order.Status status = order.getStatus();
+                if (status == Order.Status.COMPLETED ||
+                    status == Order.Status.CANCELLED ||
+                    status == Order.Status.FAILED) {
+                    continue;
+                }
+
+                long ageMs = now - order.getCreatedAt();
+                if (ageMs >= STUCK_ORDER_TIMEOUT_MS) {
+                    log.warn("reconcileStuckOrders: force-failing stuck order orderId={} status={} ageMs={}",
+                            orderId, status, ageMs);
+                    logStore.error(SVC, traceId, "STUCK_ORDER_FORCE_FAILED",
+                            "Order force-transitioned to FAILED by reconciliation job orderId=" + orderId +
+                            " previousStatus=" + status + " ageMs=" + ageMs);
+                    try {
+                        orderService.forceFailOrder(orderId, traceId);
+                        forcedCount++;
+                    } catch (Exception e) {
+                        log.error("reconcileStuckOrders: failed to force-fail orderId={} error={}",
+                                orderId, e.getMessage());
+                        logStore.error(SVC, traceId, "RECONCILE_FORCE_FAIL_ERROR",
+                                "Could not force-fail orderId=" + orderId + " â€” " + e.getMessage());
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.error("reconcileStuckOrders: unexpected error during scan traceId={} error={}",
+                    traceId, e.getMessage(), e);
+            logStore.error(SVC, traceId, "RECONCILE_SCAN_ERROR",
+                    "reconcileStuckOrders scan failed: " + e.getMessage());
+        }
+
+        log.info("reconcileStuckOrders: scan complete forcedCount={} traceId={}", forcedCount, traceId);
+        logStore.info(SVC, traceId, "reconcileStuckOrders: scan complete forcedCount=" + forcedCount);
+        if (forcedCount > 0) {
+            log.warn("ALERT: reconcileStuckOrders force-failed {} order(s) â€” investigate upstream failures", forcedCount);
+        }
+    }
 }
