@@ -425,4 +425,73 @@ public class ChaosScheduler {
             }
         }
     }
+
+
+    // Order watchdog â€” scans for orders stuck in intermediate states older than 10 minutes
+    // and routes them to MANUAL_REVIEW with an on-call alert.
+    @Scheduled(fixedDelay = 60000, initialDelay = 30000)
+    public void watchdogScan() {
+        String traceId = "watchdog-" + UUID.randomUUID().toString().substring(0, 8);
+        logStore.info(SVC, traceId, "watchdog scan: starting intermediate-state order sweep");
+        log.info("[{}] Watchdog scan started", traceId);
+
+        java.time.Instant cutoff = java.time.Instant.now().minusSeconds(600); // 10 minutes
+        List<String> intermediateStatuses = List.of(
+            "PAYMENT_PENDING", "FULFILLMENT_PENDING", "RESERVED", "CREATED"
+        );
+
+        try {
+            List<Order> allOrders = orderService.getAllOrders();
+            List<Order> stuckOrders = allOrders.stream()
+                .filter(o -> {
+                    String statusName = o.getStatus() != null ? o.getStatus().name() : "";
+                    return intermediateStatuses.contains(statusName)
+                        && o.getUpdatedAt() != null
+                        && o.getUpdatedAt().isBefore(cutoff);
+                })
+                .collect(java.util.stream.Collectors.toList());
+
+            if (stuckOrders.isEmpty()) {
+                log.info("[{}] Watchdog scan: no stuck orders found", traceId);
+                logStore.info(SVC, traceId, "watchdog scan: no stuck orders found");
+                return;
+            }
+
+            log.warn("[{}] Watchdog scan: found {} stuck order(s) â€” routing to MANUAL_REVIEW",
+                traceId, stuckOrders.size());
+            logStore.warn(SVC, traceId, "WATCHDOG_STUCK_ORDERS",
+                "watchdog found " + stuckOrders.size() + " stuck order(s) older than 10 min");
+
+            for (Order order : stuckOrders) {
+                try {
+                    log.warn("[{}] ALERT on-call: orderId={} status={} stuckSince={} â€” routing to MANUAL_REVIEW",
+                        traceId, order.getId(), order.getStatus(), order.getUpdatedAt());
+                    logStore.warn(SVC, traceId, "MANUAL_REVIEW_REQUIRED",
+                        "ONCALL ALERT: orderId=" + order.getId()
+                        + " status=" + order.getStatus()
+                        + " stuckSince=" + order.getUpdatedAt()
+                        + " â€” manual intervention required; do NOT auto-reprocess without idempotency guarantees");
+                    // Transition order to MANUAL_REVIEW state (mapped to FAILED with reason)
+                    order.setFailureReason("WATCHDOG: stuck in " + order.getStatus()
+                        + " since " + order.getUpdatedAt() + " â€” routed to MANUAL_REVIEW");
+                    order.setStatus(Order.Status.FAILED);
+                } catch (Exception e) {
+                    logStore.error(SVC, traceId, "WATCHDOG_TRANSITION_ERROR",
+                        "watchdog failed to transition orderId=" + order.getId() + " err=" + e.getMessage());
+                    log.error("[{}] Watchdog failed to transition orderId={}: {}",
+                        traceId, order.getId(), e.getMessage());
+                }
+            }
+
+            logStore.warn(SVC, traceId, "WATCHDOG_SCAN_COMPLETE",
+                "watchdog scan complete: routed " + stuckOrders.size() + " order(s) to MANUAL_REVIEW");
+            log.warn("[{}] Watchdog scan complete: routed {} order(s) to MANUAL_REVIEW",
+                traceId, stuckOrders.size());
+
+        } catch (Exception e) {
+            logStore.error(SVC, traceId, "WATCHDOG_SCAN_ERROR",
+                "watchdog scan encountered unexpected error: " + e.getMessage());
+            log.error("[{}] Watchdog scan error: {}", traceId, e.getMessage());
+        }
+    }
 }

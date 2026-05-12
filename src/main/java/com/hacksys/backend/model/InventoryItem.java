@@ -53,4 +53,10 @@ public class InventoryItem {
 
     public String getLastUpdatedBy() { return lastUpdatedBy; }
     public void setLastUpdatedBy(String lastUpdatedBy) { this.lastUpdatedBy = lastUpdatedBy; }
+
+
+    private Instant reservationExpiresAt;
+
+    public Instant getReservationExpiresAt() { return reservationExpiresAt; }
+    public void setReservationExpiresAt(Instant reservationExpiresAt) { this.reservationExpiresAt = reservationExpiresAt; }
 }
