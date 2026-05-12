@@ -285,4 +285,77 @@ public class InventoryService {
     private boolean shouldFail() {
         return Math.random() < failureRate;
     }
+
+
+    /**
+     * Scheduled background job: scans all inventory items for expired reservations
+     * and releases any phantom holds whose TTL has elapsed.
+     * Runs every 5 minutes.
+     */
+    @Scheduled(fixedDelay = 300000, initialDelay = 60000)
+    public void releaseExpiredReservations() {
+        String traceId = "inv-ttl-" + UUID.randomUUID().toString().substring(0, 8);
+        TraceContext.setService(SVC);
+        TraceContext.bindTrace(traceId);
+        Instant now = Instant.now();
+        log.info("[{}] Starting expired-reservation sweep at {}", traceId, now);
+        logStore.info(SVC, traceId, "expired-reservation sweep started at " + now);
+
+        List<String> expired = inventory.values().stream()
+            .filter(item -> item.getReservationExpiresAt() != null && item.getReservationExpiresAt().isBefore(now))
+            .map(InventoryItem::getProductId)
+            .collect(Collectors.toList());
+
+        if (expired.isEmpty()) {
+            log.info("[{}] No expired reservations found", traceId);
+            logStore.info(SVC, traceId, "expired-reservation sweep: no expired reservations found");
+            return;
+        }
+
+        for (String productId : expired) {
+            InventoryItem item = inventory.get(productId);
+            if (item == null) continue;
+            synchronized (item) {
+                // Re-check inside lock to avoid TOCTOU
+                if (item.getReservationExpiresAt() == null || !item.getReservationExpiresAt().isBefore(now)) {
+                    continue;
+                }
+                int reserved = item.getReservedStock();
+                if (reserved > 0) {
+                    int restored = item.getStock() + reserved;
+                    item.setStock(restored);
+                    item.setReservedStock(0);
+                    item.setLastUpdated(Instant.now());
+                    log.warn("[{}] Released expired reservation productId={} qty={} restoredStock={}",
+                        traceId, productId, reserved, restored);
+                    logStore.warn(SVC, traceId, "RESERVATION_EXPIRED",
+                        "released expired reservation productId=" + productId
+                        + " qty=" + reserved + " restoredStock=" + restored);
+                }
+                item.setReservationExpiresAt(null);
+            }
+        }
+
+        log.info("[{}] Expired-reservation sweep complete, released={}", traceId, expired.size());
+        logStore.info(SVC, traceId, "expired-reservation sweep complete released=" + expired.size());
+    }
+
+    /**
+     * Reserve stock for an order with a TTL so phantom holds are automatically released.
+     * reservationTtlMinutes: how long (in minutes) the reservation is valid.
+     */
+    public boolean reserveStockWithTtl(String productId, int quantity, String traceId, long reservationTtlMinutes) {
+        boolean reserved = reserveStock(productId, quantity, traceId);
+        if (reserved) {
+            InventoryItem item = inventory.get(productId);
+            if (item != null) {
+                item.setReservationExpiresAt(Instant.now().plusSeconds(reservationTtlMinutes * 60));
+                log.info("[{}] Reservation TTL set for productId={} expiresAt={}",
+                    traceId, productId, item.getReservationExpiresAt());
+                logStore.info(SVC, traceId, "reservation TTL set productId=" + productId
+                    + " expiresAt=" + item.getReservationExpiresAt());
+            }
+        }
+        return reserved;
+    }
 }

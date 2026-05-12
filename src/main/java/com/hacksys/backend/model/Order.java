@@ -77,4 +77,10 @@ public class Order {
         public double getUnitPrice() { return unitPrice; }
         public void setUnitPrice(double unitPrice) { this.unitPrice = unitPrice; }
     }
+
+
+    private String idempotencyKey;
+
+    public String getIdempotencyKey() { return idempotencyKey; }
+    public void setIdempotencyKey(String idempotencyKey) { this.idempotencyKey = idempotencyKey; }
 }
