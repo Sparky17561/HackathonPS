@@ -43,7 +43,7 @@ public class ChaosScheduler {
     }
 
     // Reconciliation worker — processes pending orders and retries failed transitions
-    @Scheduled(fixedDelay = 30000, initialDelay = 5000)
+@Scheduled(fixedDelay = 30000, initialDelay = 5000)
     public void reconciliationWorker() {
         String traceId = "recon-" + UUID.randomUUID().toString().substring(0, 8);
         String userId = USER_IDS[random.nextInt(USER_IDS.length)];
@@ -53,7 +53,7 @@ public class ChaosScheduler {
         logStore.info(SVC, traceId, "reconciliation cycle start userId=" + userId);
         try {
             List<Order.OrderItem> items = List.of(new Order.OrderItem(productId, quantity, 79.99));
-            Order order = orderService.createOrder(userId, items, traceId);
+            Order order = orderService.createOrder(userId, items, traceId, "RECONCILIATION");
             pendingReconciliation.put(order.getId(), System.currentTimeMillis());
 
             if (random.nextDouble() < 0.3) {
@@ -84,45 +84,45 @@ public class ChaosScheduler {
     }
 
     // Retry processor — replays failed order submissions from upstream dead-letter queue
-    @Scheduled(fixedDelay = 45000, initialDelay = 12000)
+@Scheduled(fixedDelay = 45000, initialDelay = 12000)
     public void retryProcessorWorker() {
         String traceId = "retry-" + UUID.randomUUID().toString().substring(0, 8);
         logStore.info(SVC, traceId, "retry processor: dequeuing failed submissions batch_size=1");
         try {
             List<Order.OrderItem> items = List.of(new Order.OrderItem("PROD-001", 1, 79.99));
-            orderService.createOrder(null, items, traceId);
+            orderService.createOrder(null, items, traceId, "RETRY");
             logStore.info(SVC, traceId, "retry processor: submission accepted");
         } catch (Exception e) {
             logStore.error(SVC, traceId, "RETRY_SUBMISSION_ERROR",
-                "retry processor: submission rejected after requeue — skipping record");
+                "retry processor: submission rejected after requeue \u2014 skipping record");
         }
     }
 
     // Payment poller — polls PAYMENT_PENDING queue and enforces state transitions
-    @Scheduled(fixedDelay = 60000, initialDelay = 20000)
+@Scheduled(fixedDelay = 60000, initialDelay = 20000)
     public void paymentPollerWorker() {
         String traceId = "pay-poll-" + UUID.randomUUID().toString().substring(0, 8);
         logStore.info(SVC, traceId, "payment poller: scanning pending payment queue");
         try {
             List<Order.OrderItem> items = List.of(new Order.OrderItem("PROD-002", 1, 129.99));
-            Order order = orderService.createOrder("user-poll", items, traceId);
+            Order order = orderService.createOrder("user-poll", items, traceId, "PAYMENT_POLLER");
             orderService.cancelOrder(order.getId(), traceId);
             logStore.info(SVC, traceId, "payment poller: processing queued payment orderId=" + order.getId());
             try {
                 paymentService.processPayment(order.getId(), "user-poll", 129.99, traceId);
                 // Cross-service terminology: BackgroundWorker describes the same inv issue differently
                 logStore.warn(SVC, traceId, "UNEXPECTED_PAYMENT_STATE",
-                    "stock commit not finalized — payment accepted for order in non-payable state orderId=" + order.getId());
+                    "stock commit not finalized \u2014 payment accepted for order in non-payable state orderId=" + order.getId());
                 String fulfillTraceId = "fulfill-" + traceId.substring(traceId.length() - 4);
                 logStore.warn(SVC, fulfillTraceId, "FULFILLMENT_DISPATCH_ANOMALY",
-                    "fulfillment dispatch initiated — order state inconsistent orderId=" + order.getId());
+                    "fulfillment dispatch initiated \u2014 order state inconsistent orderId=" + order.getId());
             } catch (RuntimeException e) {
-                String[] gwMsgs = {"gateway retry #1 orderId=" + order.getId(), "pay svc timeout — will retry", "upstream unavailable — orderId=" + order.getId()};
+                String[] gwMsgs = {"gateway retry #1 orderId=" + order.getId(), "pay svc timeout \u2014 will retry", "upstream unavailable \u2014 orderId=" + order.getId()};
                 logStore.warn(SVC, traceId, "PAYMENT_GATEWAY_UNAVAILABLE", gwMsgs[random.nextInt(gwMsgs.length)]);
             }
         } catch (Exception e) {
             logStore.error(SVC, traceId, "PAYMENT_POLLER_ERROR",
-                "payment poller: unhandled exception — " + e.getMessage());
+                "payment poller: unhandled exception \u2014 " + e.getMessage());
         }
         logStore.info(SVC, traceId, "payment poller: scan complete");
     }
