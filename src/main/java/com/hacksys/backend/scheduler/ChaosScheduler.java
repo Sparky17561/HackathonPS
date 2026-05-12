@@ -425,4 +425,88 @@ public class ChaosScheduler {
             }
         }
     }
+
+
+// Stuck-order recovery job â€” resolves orders stuck in non-terminal states beyond TTL
+    @Scheduled(fixedDelayString = "${order.recovery.interval-ms:300000}", initialDelay = 15000)
+    public void recoverStuckOrders() {
+        String traceId = "recovery-" + UUID.randomUUID().toString().substring(0, 8);
+        logStore.info(SVC, traceId, "stuck-order recovery: starting scan");
+
+        long ttlMs = Long.parseLong(
+            System.getProperty("order.recovery.ttl-ms", "900000") // default 15 minutes
+        );
+        Instant cutoff = java.time.Instant.now().minusMillis(ttlMs);
+
+        List<Order> stuckOrders;
+        try {
+            stuckOrders = orderService.findStuckOrders(cutoff);
+        } catch (Exception e) {
+            logStore.error(SVC, traceId, "RECOVERY_QUERY_FAILED",
+                "stuck-order recovery: failed to query stuck orders: " + e.getMessage());
+            return;
+        }
+
+        if (stuckOrders == null || stuckOrders.isEmpty()) {
+            logStore.info(SVC, traceId, "stuck-order recovery: no stuck orders found");
+            return;
+        }
+
+        logStore.info(SVC, traceId, "stuck-order recovery: found " + stuckOrders.size() + " stuck order(s)");
+
+        for (Order order : stuckOrders) {
+            String orderId = order.getId();
+            String recoveryTrace = traceId + "-" + orderId.substring(0, Math.min(8, orderId.length()));
+            try {
+                logStore.info(SVC, recoveryTrace,
+                    "stuck-order recovery: checking orderId=" + orderId
+                    + " status=" + order.getStatus()
+                    + " createdAt=" + order.getCreatedAt());
+
+                PaymentService.PaymentStatusResult gatewayStatus =
+                    paymentService.queryPaymentStatus(orderId, recoveryTrace);
+
+                if (gatewayStatus != null && gatewayStatus.isConfirmed()) {
+                    // Payment was captured â€” advance order to CONFIRMED and trigger fulfillment
+                    logStore.info(SVC, recoveryTrace,
+                        "stuck-order recovery: payment confirmed by gateway, advancing orderId=" + orderId);
+                    orderService.forceAdvanceToConfirmed(orderId, recoveryTrace);
+                    logStore.info(SVC, recoveryTrace,
+                        "stuck-order recovery: orderId=" + orderId + " advanced to PAYMENT_CONFIRMED");
+                } else {
+                    // Payment not found or failed â€” cancel order, release inventory, set FAILED
+                    logStore.warn(SVC, recoveryTrace, "PAYMENT_NOT_CONFIRMED",
+                        "stuck-order recovery: payment not confirmed for orderId=" + orderId
+                        + ", cancelling and releasing inventory");
+                    try {
+                        inventoryService.releaseReservation(orderId, recoveryTrace);
+                    } catch (Exception invEx) {
+                        logStore.error(SVC, recoveryTrace, "INVENTORY_RELEASE_FAILED",
+                            "stuck-order recovery: failed to release inventory for orderId=" + orderId
+                            + ": " + invEx.getMessage());
+                    }
+                    orderService.failOrder(orderId, recoveryTrace);
+                    logStore.warn(SVC, recoveryTrace, "ORDER_FAILED_BY_RECOVERY",
+                        "stuck-order recovery: orderId=" + orderId
+                        + " set to FAILED; user notification event emitted");
+                    // Emit user notification event
+                    try {
+                        orderService.emitUserNotification(orderId, order.getUserId(),
+                            "Your order could not be completed and has been cancelled. Please retry.",
+                            recoveryTrace);
+                    } catch (Exception notifEx) {
+                        logStore.error(SVC, recoveryTrace, "NOTIFICATION_FAILED",
+                            "stuck-order recovery: failed to emit notification for orderId=" + orderId
+                            + ": " + notifEx.getMessage());
+                    }
+                }
+            } catch (Exception e) {
+                logStore.error(SVC, recoveryTrace, "RECOVERY_STEP_FAILED",
+                    "stuck-order recovery: unhandled error processing orderId=" + orderId
+                    + ": " + e.getMessage());
+            }
+        }
+
+        logStore.info(SVC, traceId, "stuck-order recovery: scan complete");
+    }
 }
