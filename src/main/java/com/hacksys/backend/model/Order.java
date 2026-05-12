@@ -48,7 +48,14 @@ public class Order {
     public List<OrderItem> getItems() { return items; }
     public void setItems(List<OrderItem> items) { this.items = items; }
 
-    public Instant getCreatedAt() { return createdAt; }
+public Instant getCreatedAt() {
+        if (createdAt == null) {
+            // Defensive fallback: if createdAt was never set, return epoch so recovery job
+            // treats this order as maximally old and eligible for recovery.
+            return Instant.EPOCH;
+        }
+        return createdAt;
+    }
     public Instant getUpdatedAt() { return updatedAt; }
 
     public String getPaymentId() { return paymentId; }

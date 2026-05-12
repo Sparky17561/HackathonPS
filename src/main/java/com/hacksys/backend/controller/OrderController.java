@@ -32,7 +32,7 @@ public class OrderController {
      * POST /order
      * Body: { "userId": "...", "items": [{ "productId": "...", "quantity": N, "unitPrice": N }] }
      */
-    @PostMapping
+@PostMapping
     public ResponseEntity<?> createOrder(@RequestBody Map<String, Object> body) {
         String traceId = TraceContext.initTrace();
         TraceContext.setService(SVC);
@@ -51,11 +51,32 @@ public class OrderController {
             }
 
             List<Order.OrderItem> items = rawItems.stream().map(raw -> {
-                String productId = (String) raw.get("productId"); // can be null — intentional
+                String productId = (String) raw.get("productId"); // can be null â€” intentional
                 int qty = raw.containsKey("quantity") ? ((Number) raw.get("quantity")).intValue() : 1;
                 double price = raw.containsKey("unitPrice") ? ((Number) raw.get("unitPrice")).doubleValue() : 0.0;
                 return new Order.OrderItem(productId, qty, price);
             }).toList();
+
+            // Idempotency guard: check for an existing non-terminal order for this user
+            // with the same item fingerprint to prevent duplicate orders on client retry.
+            if (userId != null) {
+                Order existingOrder = orderService.findExistingActiveOrder(userId, items, traceId);
+                if (existingOrder != null) {
+                    log.info("POST /order duplicate detected, returning existing orderId={} status={}",
+                        existingOrder.getId(), existingOrder.getStatus());
+                    logStore.warn(SVC, traceId, "DUPLICATE_ORDER_DETECTED",
+                        "Non-terminal order already exists for userId=" + userId
+                        + " orderId=" + existingOrder.getId()
+                        + " status=" + existingOrder.getStatus()
+                        + " â€” returning existing order instead of creating duplicate");
+                    return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
+                        "orderId", existingOrder.getId(),
+                        "status", existingOrder.getStatus().name(),
+                        "trace_id", traceId,
+                        "message", "An active order already exists for this request. Resume or cancel the existing order."
+                    ));
+                }
+            }
 
             Order order = orderService.createOrder(userId, items, traceId);
 
