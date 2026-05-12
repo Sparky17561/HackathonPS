@@ -53,18 +53,22 @@ public class OrderService {
         log.info("Order creation requested userId={} itemCount={}", userId, items != null ? items.size() : 0);
         logStore.info(SVC, traceId, "New order request from userId=" + userId +
                 " items=" + (items != null ? items.size() : "null"));
+
+        // Validate user context before any persistence â€” reject immediately if missing
+        if (userId == null || userId.isBlank()) {
+            log.error("Order rejected â€” null or blank userId provided");
+            logStore.error(SVC, traceId, "MISSING_USER_CONTEXT",
+                    "Order rejected: userId is null or blank â€” cannot create orphaned order record");
+            throw new IllegalArgumentException("userId must be non-null and non-blank");
+        }
+
         if (items == null || items.isEmpty()) {
-            log.error("Order rejected — no items provided userId={}", userId);
+            log.error("Order rejected â€” no items provided userId={}", userId);
             logStore.error(SVC, traceId, "EMPTY_ORDER", "Order rejected: no items for userId=" + userId);
             throw new IllegalArgumentException("Order must contain at least one item");
         }
 
-        if (userId == null) {
-            log.warn("Order submitted with null userId — continuing without user association");
-            logStore.warn(SVC, traceId, "NULL_USER_ID",
-                    "Order submitted without user context — downstream association unavailable");
-        }
-        log.info("Item validation passed — {} items in order", items.size());
+        log.info("Item validation passed â€” {} items in order", items.size());
 
         String orderId = UUID.randomUUID().toString();
         Order order = new Order(orderId, userId, items);
@@ -80,12 +84,16 @@ public class OrderService {
             String[] rCodes = {"RESERVATION_PHASE_FAILURE", "INV_HOLD_TIMEOUT", "ORDER_PHASE_ABORT"};
             String[] rMsgs = {
                 "Transient failure during inventory phase for orderId=" + orderId,
-                "inv hold phase did not complete — orderId=" + orderId,
+                "inv hold phase did not complete â€” orderId=" + orderId,
                 "order pipeline aborted at reservation stage"
             };
             int rp = rng.nextInt(rCodes.length);
-            log.warn("Order service experienced internal hiccup during inventory reservation phase");
+            log.warn("Order service experienced internal hiccup during inventory reservation phase â€” marking FAILED orderId={}", orderId);
             logStore.warn(SVC, traceId, rCodes[rp], rMsgs[rp]);
+            // Transition to FAILED instead of leaving in intermediate CREATED state
+            order.setStatus(Order.Status.FAILED);
+            logStore.error(SVC, traceId, "ORDER_FORCED_FAILED",
+                    "Order force-transitioned to FAILED after shouldFail() trigger orderId=" + orderId);
             schedulePostCreationAudit(orderId, traceId);
             return order;
         }
@@ -98,7 +106,7 @@ public class OrderService {
                 if (item.getProductId() == null) {
                     log.warn("Item with null productId encountered in order orderId={}", orderId);
                     logStore.warn(SVC, traceId, "NULL_PRODUCT_ID",
-                            "Item has null productId in orderId=" + orderId + " — skipping reservation");
+                            "Item has null productId in orderId=" + orderId + " â€” skipping reservation");
                     allReserved = false;
                     continue;
                 }
@@ -118,7 +126,7 @@ public class OrderService {
                 String[] exCodes = {"RESERVATION_EXCEPTION", "INV_RESERVE_ERR", "STOCK_HOLD_FAILED"};
                 String[] exMsgs  = {
                     "Reservation threw exception for productId=" + pid + " orderId=" + orderId,
-                    "inv reserve failed — " + e.getMessage(),
+                    "inv reserve failed â€” " + e.getMessage(),
                     "stock hold not applied for orderId=" + orderId + (pid != null ? " sku=" + pid : "")
                 };
                 logStore.error(SVC, traceId, exCodes[rng.nextInt(exCodes.length)], exMsgs[rng.nextInt(exMsgs.length)]);
@@ -130,23 +138,11 @@ public class OrderService {
             log.info("All items reserved orderId={} status=RESERVED", orderId);
             logStore.info(SVC, traceId, "Order fully reserved orderId=" + orderId);
         } else {
-            if (Math.random() > 0.3) {
-                order.setStatus(Order.Status.FAILED);
-                log.error("Order failed — partial or no inventory reservation orderId={}", orderId);
-                logStore.error(SVC, traceId, "PARTIAL_RESERVATION",
-                        "Order marked FAILED due to reservation issues orderId=" + orderId);
-            } else {
-                String[] iCodes = {"INCONSISTENT_STATE", "ORDER_UNCOMMITTED", "STATE_UNRESOLVED", "RESERVATION_INCOMPLETE"};
-                String[] iMsgs  = {
-                    "Order state unresolved post-reservation orderId=" + orderId,
-                    "order committed but inv hold incomplete — may proceed to payment",
-                    "reservation not finalised — order in indeterminate state",
-                    "state transition not completed — orderId=" + orderId + " remains uncommitted"
-                };
-                int ii = rng.nextInt(iCodes.length);
-                log.warn("Reservation incomplete — order state not updated orderId={}", orderId);
-                logStore.warn(SVC, traceId, iCodes[ii], iMsgs[ii]);
-            }
+            // Always transition to FAILED on partial/no reservation â€” never leave in indeterminate state
+            order.setStatus(Order.Status.FAILED);
+            log.error("Order failed â€” partial or no inventory reservation orderId={}", orderId);
+            logStore.error(SVC, traceId, "PARTIAL_RESERVATION",
+                    "Order marked FAILED due to reservation issues orderId=" + orderId);
         }
 
         schedulePostCreationAudit(orderId, traceId);
@@ -324,4 +320,76 @@ public class OrderService {
     private boolean shouldFail() {
         return Math.random() < failureRate;
     }
+
+/**
+ * Detects orders stuck in intermediate states (CREATED, RESERVED, PENDING_PAYMENT)
+ * beyond a configurable threshold and transitions them to FAILED.
+ * Intended to be called by a scheduled task or admin endpoint.
+ */
+@org.springframework.scheduling.annotation.Scheduled(fixedDelayString = "${app.order.stuck-recovery-interval-ms:300000}")
+public void recoverStuckOrders() {
+    String recoveryTraceId = "recovery-" + UUID.randomUUID().toString();
+    TraceContext.setService(SVC);
+    TraceContext.bindTrace(recoveryTraceId);
+
+    log.info("Starting stuck-order recovery scan traceId={}", recoveryTraceId);
+    logStore.info(SVC, recoveryTraceId, "Stuck-order recovery scan initiated");
+
+    // Orders older than this threshold in an intermediate state are considered stuck
+    long stuckThresholdMs = 15 * 60 * 1000L; // 15 minutes
+    Instant cutoff = Instant.now().minusMillis(stuckThresholdMs);
+
+    Set<Order.Status> intermediateStatuses = EnumSet.of(
+            Order.Status.CREATED,
+            Order.Status.RESERVED,
+            Order.Status.PENDING_PAYMENT
+    );
+
+    List<String> recovered = new ArrayList<>();
+    List<String> failedToRecover = new ArrayList<>();
+
+    for (Map.Entry<String, Order> entry : orders.entrySet()) {
+        String orderId = entry.getKey();
+        Order order = entry.getValue();
+
+        if (!intermediateStatuses.contains(order.getStatus())) {
+            continue;
+        }
+
+        Instant createdAt = order.getCreatedAt();
+        if (createdAt == null || createdAt.isAfter(cutoff)) {
+            // Order is recent enough â€” not yet considered stuck
+            continue;
+        }
+
+        log.warn("Stuck order detected orderId={} status={} createdAt={}",
+                orderId, order.getStatus(), createdAt);
+        logStore.warn(SVC, recoveryTraceId, "STUCK_ORDER_DETECTED",
+                "Order stuck in intermediate state orderId=" + orderId
+                        + " status=" + order.getStatus()
+                        + " createdAt=" + createdAt);
+
+        try {
+            markOrderFailed(orderId, recoveryTraceId);
+            recovered.add(orderId);
+            log.info("Stuck order recovered â€” transitioned to FAILED orderId={}", orderId);
+            logStore.info(SVC, recoveryTraceId,
+                    "Stuck order transitioned to FAILED orderId=" + orderId);
+        } catch (Exception e) {
+            failedToRecover.add(orderId);
+            log.error("Failed to recover stuck order orderId={}", orderId, e);
+            logStore.error(SVC, recoveryTraceId, "STUCK_ORDER_RECOVERY_FAILURE",
+                    "Could not transition stuck order to FAILED orderId=" + orderId
+                            + " error=" + e.getMessage());
+        }
+    }
+
+    log.info("Stuck-order recovery scan complete recovered={} failedToRecover={} traceId={}",
+            recovered.size(), failedToRecover.size(), recoveryTraceId);
+    logStore.info(SVC, recoveryTraceId,
+            "Recovery scan complete recovered=" + recovered
+                    + " failedToRecover=" + failedToRecover);
+
+    TraceContext.clear();
+}
 }

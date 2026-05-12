@@ -42,6 +42,16 @@ public class OrderController {
 
         try {
             String userId = (String) body.get("userId");
+
+            // Reject immediately at the controller boundary if userId is absent
+            if (userId == null || userId.isBlank()) {
+                log.warn("POST /order rejected â€” missing or blank userId");
+                logStore.error(SVC, traceId, "MISSING_USER_ID",
+                        "Order request rejected at controller: userId is null or blank");
+                return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                        .body(Map.of("error", "userId is required and must be non-blank", "trace_id", traceId));
+            }
+
             @SuppressWarnings("unchecked")
             List<Map<String, Object>> rawItems = (List<Map<String, Object>>) body.get("items");
 
@@ -51,7 +61,7 @@ public class OrderController {
             }
 
             List<Order.OrderItem> items = rawItems.stream().map(raw -> {
-                String productId = (String) raw.get("productId"); // can be null — intentional
+                String productId = (String) raw.get("productId"); // can be null â€” intentional
                 int qty = raw.containsKey("quantity") ? ((Number) raw.get("quantity")).intValue() : 1;
                 double price = raw.containsKey("unitPrice") ? ((Number) raw.get("unitPrice")).doubleValue() : 0.0;
                 return new Order.OrderItem(productId, qty, price);
