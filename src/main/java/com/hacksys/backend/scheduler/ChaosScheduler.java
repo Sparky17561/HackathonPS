@@ -425,4 +425,81 @@ public class ChaosScheduler {
             }
         }
     }
+
+
+// Stuck-order reconciliation job â€” runs every 5 minutes
+@Scheduled(fixedDelay = 300000, initialDelay = 15000)
+public void reconcileStuckOrders() {
+    String traceId = "stuck-recon-" + UUID.randomUUID().toString().substring(0, 8);
+    logStore.info(SVC, traceId, "reconcileStuckOrders: starting stuck-order scan");
+
+    // 2x the inventory service timeout (default 5000ms -> threshold = 10000ms)
+    long timeoutMs = 10000L;
+    try {
+        String timeoutEnv = System.getenv("INVENTORY_SERVICE_TIMEOUT_MS");
+        if (timeoutEnv != null && !timeoutEnv.isBlank()) {
+            timeoutMs = Long.parseLong(timeoutEnv.trim()) * 2;
+        }
+    } catch (NumberFormatException ignored) {}
+
+    long cutoffEpochMs = System.currentTimeMillis() - timeoutMs;
+
+    List<Order> stuckOrders;
+    try {
+        stuckOrders = orderService.findOrdersByStates(
+            List.of("RESERVATION_UNCERTAIN", "RESERVING"), cutoffEpochMs, traceId);
+    } catch (Exception e) {
+        logStore.error(SVC, traceId, "STUCK_RECON_QUERY_FAILED",
+            "reconcileStuckOrders: failed to query stuck orders: " + e.getMessage());
+        return;
+    }
+
+    // Emit metric: stuck_orders_count by state
+    Map<String, Long> countByState = stuckOrders.stream()
+        .collect(java.util.stream.Collectors.groupingBy(
+            o -> o.getStatus() != null ? o.getStatus() : "UNKNOWN",
+            java.util.stream.Collectors.counting()));
+
+    countByState.forEach((state, count) -> {
+        logStore.info(SVC, traceId,
+            "METRIC stuck_orders_count state=" + state + " count=" + count);
+        if (count > 0) {
+            // Record first-seen timestamp for alerting (alert if stuck > 10 min)
+            String alertKey = "stuck_alert_" + state;
+            pendingReconciliation.putIfAbsent(alertKey, System.currentTimeMillis());
+            long firstSeen = pendingReconciliation.get(alertKey);
+            long stuckDurationMs = System.currentTimeMillis() - firstSeen;
+            if (stuckDurationMs > 600000L) {
+                logStore.error(SVC, traceId, "STUCK_ORDERS_ALERT",
+                    "ALERT: orders in state=" + state + " stuck for >10 min count=" + count);
+            }
+        } else {
+            pendingReconciliation.remove("stuck_alert_" + state);
+        }
+    });
+
+    if (stuckOrders.isEmpty()) {
+        logStore.info(SVC, traceId, "reconcileStuckOrders: no stuck orders found");
+        return;
+    }
+
+    logStore.info(SVC, traceId,
+        "reconcileStuckOrders: processing stuck orders count=" + stuckOrders.size());
+
+    for (Order order : stuckOrders) {
+        String orderTraceId = traceId + "-" + order.getId().substring(0, Math.min(8, order.getId().length()));
+        try {
+            logStore.info(SVC, orderTraceId,
+                "reconcileStuckOrders: running compensation for orderId=" + order.getId()
+                + " state=" + order.getStatus());
+            orderService.runSagaCompensation(order.getId(), orderTraceId);
+        } catch (Exception e) {
+            logStore.error(SVC, orderTraceId, "STUCK_RECON_COMPENSATION_FAILED",
+                "reconcileStuckOrders: compensation failed for orderId=" + order.getId()
+                + " error=" + e.getMessage());
+        }
+    }
+
+    logStore.info(SVC, traceId, "reconcileStuckOrders: scan complete");
+}
 }
