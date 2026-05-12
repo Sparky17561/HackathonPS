@@ -68,105 +68,160 @@ public class InventoryService {
     /**
      * Reserve stock for an order.
      */
-    public boolean reserveStock(String productId, int quantity, String traceId) {
-        TraceContext.setService(SVC);
-        TraceContext.bindTrace(traceId);
-        MDC.put("product_id", productId);
+@Transactional(rollbackFor = Exception.class)
+public boolean reserveStock(String productId, int quantity, String traceId) {
+    TraceContext.setService(SVC);
+    TraceContext.bindTrace(traceId);
+    MDC.put("product_id", productId);
 
-        log.info("Attempting to reserve stock productId={} qty={}", productId, quantity);
-        logStore.info(SVC, traceId, "Stock reservation requested for " + productId + " qty=" + quantity);
+    log.info("Attempting to reserve stock productId={} qty={}", productId, quantity);
+    logStore.info(SVC, traceId, "Stock reservation requested for " + productId + " qty=" + quantity);
 
-        InventoryItem item = inventory.get(productId);
-        if (item == null) {
-            log.warn("Product not found in inventory productId={}", productId);
-            logStore.warn(SVC, traceId, "PRODUCT_NOT_FOUND",
-                    "Reservation failed — product not found: " + productId);
-            return false;
-        }
+    if (quantity <= 0) {
+        log.error("Invalid reservation quantity={} for productId={}", quantity, productId);
+        logStore.error(SVC, traceId, "INVALID_QUANTITY",
+                "Reservation rejected â€” quantity must be positive: qty=" + quantity + " sku=" + productId);
+        return false;
+    }
 
-        if (shouldFail()) {
-            String[] codes = {"INV_TIMEOUT", "STORE_TIMEOUT", "WAREHOUSE_DELAY", "INV_SVC_TIMEOUT"};
-            String[] msgs  = {
-                "inv svc timeout — reservation incomplete prod=" + productId,
-                "store momentarily unavailable, hold not applied",
-                "warehouse feed delayed — stock not committed for " + productId,
-                "reservation timed out — retrying reserve op"
-            };
-            int pick = rng.nextInt(codes.length);
-            log.warn("inv svc timeout productId={}", productId);
-            logStore.warn(SVC, traceId, codes[pick], msgs[pick]);
-            throw new RuntimeException("Inventory store transient failure");
-        }
+    InventoryItem item = inventory.get(productId);
+    if (item == null) {
+        log.warn("Product not found in inventory productId={}", productId);
+        logStore.warn(SVC, traceId, "PRODUCT_NOT_FOUND",
+                "Reservation failed â€” product not found: " + productId);
+        return false;
+    }
 
-        int current = item.getStock();
+    if (shouldFail()) {
+        log.warn("Transient failure during reservation productId={}", productId);
+        logStore.warn(SVC, traceId, "INV_SVC_TIMEOUT",
+                "Inventory service transient failure â€” reservation not applied for sku=" + productId
+                + "; compensating entry queued for dead-letter processing");
+        // Enqueue compensating/dead-letter entry so the reservation can be retried or rolled back
+        deadLetterQueue.enqueue(new DeadLetterEntry(
+                traceId, productId, quantity, "RESERVE", Instant.now()));
+        throw new InventoryTransientException(
+                "Inventory store transient failure â€” reservation queued for retry: sku=" + productId,
+                traceId);
+    }
+
+    // Atomic CAS loop: equivalent to
+    // UPDATE inventory SET stock = stock - qty, reserved = reserved + qty
+    // WHERE sku_id = sku AND stock >= qty
+    int maxRetries = 10;
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+        int current = item.getStockRef().get();
         log.info("Current stock for {} = {}, requesting {}", productId, current, quantity);
 
         if (current < quantity) {
-            String[] msgs = {
-                "insufficient stock — available=" + current + " requested=" + quantity + " sku=" + productId,
-                "stock check fail: have=" + current + " need=" + quantity,
-                "cannot reserve — stock level below threshold for " + productId
-            };
-            log.warn("Insufficient stock productId={} available={} requested={}", productId, current, quantity);
-            logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK", msgs[rng.nextInt(msgs.length)]);
+            log.warn("Insufficient stock productId={} available={} requested={}",
+                    productId, current, quantity);
+            logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK",
+                    "Reservation failed â€” insufficient stock: available=" + current
+                    + " requested=" + quantity + " sku=" + productId);
             return false;
         }
 
-        try { Thread.sleep(10); } catch (InterruptedException ignored) {}
-
-        item.setStock(current - quantity);
-        item.setReservedStock(item.getReservedStock() + quantity);
-        item.setLastUpdated(Instant.now());
-
-        log.info("Stock reserved productId={} reserved={} remaining={}", productId, quantity, item.getStock());
-        if (rng.nextInt(10) < 8) {
-            logStore.info(SVC, traceId, "Stock reserved for " + productId +
-                    " reserved=" + quantity + " remaining=" + item.getStock());
-        } else {
-            logStore.info(SVC, traceId, "reservation ok sku=" + productId + " qty=" + quantity);
+        int newStock = current - quantity;
+        if (newStock < 0) {
+            log.error("Stock floor guard triggered during reservation productId={}", productId);
+            logStore.error(SVC, traceId, "STOCK_FLOOR_GUARD",
+                    "Reservation aborted â€” would result in negative stock: current=" + current
+                    + " qty=" + quantity + " sku=" + productId);
+            return false;
         }
 
-        return true;
+        if (item.getStockRef().compareAndSet(current, newStock)) {
+            item.setReservedStock(item.getReservedStock() + quantity);
+            item.setLastUpdated(Instant.now());
+            log.info("Stock reserved productId={} reserved={} remaining={}",
+                    productId, quantity, newStock);
+            logStore.info(SVC, traceId,
+                    "Stock reserved for " + productId
+                    + " reserved=" + quantity + " remaining=" + newStock);
+            return true;
+        }
+        log.debug("CAS contention on reserveStock productId={} attempt={}", productId, attempt);
     }
+
+    log.error("Reservation failed after {} CAS retries productId={}", maxRetries, productId);
+    logStore.error(SVC, traceId, "RESERVE_CAS_EXHAUSTED",
+            "Atomic reservation failed after max retries â€” sku=" + productId
+            + "; compensating entry queued");
+    deadLetterQueue.enqueue(new DeadLetterEntry(
+            traceId, productId, quantity, "RESERVE", Instant.now()));
+    return false;
+}
 
     /**
      * Hard deduct (used by payment confirmation path).
      */
-    public boolean deductStock(String productId, int quantity, String traceId) {
-        TraceContext.setService(SVC);
-        TraceContext.bindTrace(traceId);
+@Transactional(rollbackFor = Exception.class)
+public boolean deductStock(String productId, int quantity, String traceId) {
+    TraceContext.setService(SVC);
+    TraceContext.bindTrace(traceId);
 
-        log.info("Deducting stock productId={} qty={}", productId, quantity);
-        logStore.info(SVC, traceId, "Hard stock deduction initiated for " + productId + " qty=" + quantity);
+    log.info("Deducting stock productId={} qty={}", productId, quantity);
+    logStore.info(SVC, traceId, "Hard stock deduction initiated for " + productId + " qty=" + quantity);
 
-        InventoryItem item = inventory.get(productId);
-        if (item == null) {
-            log.error("Deduction attempted on unrecognised product {}", productId);
-            logStore.error(SVC, traceId, "DEDUCT_UNKNOWN_PRODUCT",
-                    "Stock deduction for unknown product — record not found: " + productId);
-            return true;
-        }
-
-        int newStock = item.getStockRef().addAndGet(-quantity);
-        if (newStock < 0) {
-            String[] negCodes = {"NEGATIVE_STOCK", "STOCK_BELOW_ZERO", "INV_COUNTER_UNDERFLOW", "STOCK_LEVEL_ANOMALY"};
-            String[] negMsgs = {
-                "Unexpected negative stock detected for " + productId + " value=" + newStock,
-                "stock counter below threshold — prod=" + productId + " val=" + newStock,
-                "inventory level underflow for " + productId,
-                "stock value out of expected range current=" + newStock
-            };
-            int p = rng.nextInt(negCodes.length);
-            log.warn("stock below zero productId={} stock={}", productId, newStock);
-            logStore.warn(SVC, traceId, negCodes[p], negMsgs[p]);
-        }
-
-        item.setLastUpdated(Instant.now());
-        log.info("Stock deducted productId={} newStock={}", productId, newStock);
-        logStore.info(SVC, traceId, "Deduction complete for " + productId + " newStock=" + newStock);
-
-        return true;
+    if (quantity <= 0) {
+        log.error("Invalid deduction quantity={} for productId={}", quantity, productId);
+        logStore.error(SVC, traceId, "INVALID_QUANTITY",
+                "Deduction rejected â€” quantity must be positive: qty=" + quantity + " sku=" + productId);
+        return false;
     }
+
+    InventoryItem item = inventory.get(productId);
+    if (item == null) {
+        log.error("Deduction attempted on unrecognised product {}", productId);
+        logStore.error(SVC, traceId, "DEDUCT_UNKNOWN_PRODUCT",
+                "Stock deduction for unknown product â€” record not found: " + productId);
+        return false;
+    }
+
+    // Atomic compare-and-set loop: replaces non-atomic read-then-write
+    // Equivalent to: UPDATE inventory SET stock = stock - qty WHERE sku_id = sku AND stock >= qty
+    boolean deducted = false;
+    int maxRetries = 10;
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+        int current = item.getStockRef().get();
+        if (current < quantity) {
+            log.warn("INSUFFICIENT_STOCK productId={} available={} requested={}", productId, current, quantity);
+            logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK",
+                    "Deduction failed â€” insufficient stock: available=" + current
+                    + " requested=" + quantity + " sku=" + productId);
+            return false;
+        }
+        int newStock = current - quantity;
+        if (newStock < 0) {
+            // Hard floor guard â€” should never reach here due to check above, but defensive
+            log.error("Stock floor guard triggered productId={} current={} qty={}", productId, current, quantity);
+            logStore.error(SVC, traceId, "STOCK_FLOOR_GUARD",
+                    "Deduction aborted â€” would result in negative stock: current=" + current
+                    + " qty=" + quantity + " sku=" + productId);
+            return false;
+        }
+        if (item.getStockRef().compareAndSet(current, newStock)) {
+            deducted = true;
+            item.setLastUpdated(Instant.now());
+            log.info("Stock deducted atomically productId={} newStock={}", productId, newStock);
+            logStore.info(SVC, traceId,
+                    "Deduction complete for " + productId + " newStock=" + newStock);
+            break;
+        }
+        // CAS failed â€” another thread modified stock concurrently; retry
+        log.debug("CAS contention on deductStock productId={} attempt={}", productId, attempt);
+    }
+
+    if (!deducted) {
+        log.error("Deduction failed after {} CAS retries productId={}", maxRetries, productId);
+        logStore.error(SVC, traceId, "DEDUCT_CAS_EXHAUSTED",
+                "Atomic deduction failed after max retries â€” sku=" + productId);
+        return false;
+    }
+
+    return true;
+}
 
     /**
      * Release reserved stock (called on cancel or refund).

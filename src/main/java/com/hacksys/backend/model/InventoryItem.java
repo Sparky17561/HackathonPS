@@ -17,7 +17,8 @@ public class InventoryItem {
     // Intentional: no update history / audit trail
     private String lastUpdatedBy;
 
-    public InventoryItem() {}
+@org.hibernate.annotations.Check(constraints = "stock >= 0")
+public InventoryItem() {}
 
     public InventoryItem(String productId, String name, int initialStock, double price) {
         this.productId = productId;
