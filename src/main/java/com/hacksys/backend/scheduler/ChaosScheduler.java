@@ -425,4 +425,105 @@ public class ChaosScheduler {
             }
         }
     }
+
+
+/**
+ * Reconciliation job â€” runs every 5 minutes, finds orders stuck in non-terminal
+ * states for longer than STUCK_THRESHOLD_MS (default 10 minutes), queries the
+ * payment provider for their true state, and either completes or cancels them
+ * with appropriate inventory compensation.
+ */
+@Scheduled(fixedDelayString = "${reconciliation.interval.ms:300000}", initialDelay = 15000)
+public void reconcileStuckOrders() {
+    String traceId = "stuck-recon-" + UUID.randomUUID().toString().substring(0, 8);
+    long stuckThresholdMs = Long.parseLong(
+        System.getProperty("reconciliation.stuck.threshold.ms", "600000")
+    );
+    long cutoffTime = System.currentTimeMillis() - stuckThresholdMs;
+
+    logStore.info(SVC, traceId, "reconcileStuckOrders: starting scan thresholdMs=" + stuckThresholdMs);
+
+    try {
+        List<Order> stuckOrders = orderService.findOrdersInNonTerminalStatesBefore(cutoffTime, traceId);
+
+        if (stuckOrders == null || stuckOrders.isEmpty()) {
+            logStore.info(SVC, traceId, "reconcileStuckOrders: no stuck orders found");
+            return;
+        }
+
+        logStore.info(SVC, traceId, "reconcileStuckOrders: found " + stuckOrders.size() + " stuck order(s)");
+
+        for (Order order : stuckOrders) {
+            String orderId = order.getId();
+            String orderTraceId = traceId + "-" + orderId.substring(0, Math.min(8, orderId.length()));
+            try {
+                logStore.info(SVC, orderTraceId,
+                    "reconcileStuckOrders: inspecting orderId=" + orderId
+                    + " state=" + order.getStatus()
+                    + " userId=" + order.getUserId());
+
+                boolean paymentCaptured = false;
+                try {
+                    paymentCaptured = paymentService.isPaymentCaptured(orderId, orderTraceId);
+                } catch (Exception providerEx) {
+                    logStore.error(SVC, orderTraceId, "PROVIDER_QUERY_FAILED",
+                        "reconcileStuckOrders: could not determine payment state for orderId="
+                        + orderId + " err=" + providerEx.getMessage());
+                    // Cannot determine state â€” skip this order, do not mutate
+                    continue;
+                }
+
+                if (paymentCaptured) {
+                    // Payment was captured â€” attempt to complete the order
+                    try {
+                        orderService.completeOrder(orderId, orderTraceId);
+                        logStore.info(SVC, orderTraceId,
+                            "reconcileStuckOrders: orderId=" + orderId
+                            + " transitioned to COMPLETED (payment was captured)");
+                    } catch (Exception completeEx) {
+                        logStore.error(SVC, orderTraceId, "COMPLETE_TRANSITION_FAILED",
+                            "reconcileStuckOrders: failed to complete orderId=" + orderId
+                            + " err=" + completeEx.getMessage());
+                    }
+                } else {
+                    // Payment was NOT captured â€” cancel and release inventory
+                    try {
+                        orderService.cancelOrder(orderId, orderTraceId);
+                        logStore.info(SVC, orderTraceId,
+                            "reconcileStuckOrders: orderId=" + orderId
+                            + " transitioned to CANCELLED (no payment captured)");
+                    } catch (Exception cancelEx) {
+                        logStore.error(SVC, orderTraceId, "CANCEL_TRANSITION_FAILED",
+                            "reconcileStuckOrders: failed to cancel orderId=" + orderId
+                            + " err=" + cancelEx.getMessage());
+                    }
+
+                    // Always attempt inventory release regardless of cancel outcome
+                    try {
+                        inventoryService.releaseReservation(orderId, orderTraceId);
+                        logStore.info(SVC, orderTraceId,
+                            "reconcileStuckOrders: inventory reservation released for orderId=" + orderId);
+                    } catch (Exception invEx) {
+                        logStore.error(SVC, orderTraceId, "INVENTORY_RELEASE_FAILED",
+                            "reconcileStuckOrders: failed to release inventory for orderId=" + orderId
+                            + " err=" + invEx.getMessage());
+                    }
+                }
+
+                pendingReconciliation.remove(orderId);
+
+            } catch (Exception orderEx) {
+                logStore.error(SVC, orderTraceId, "STUCK_ORDER_RECONCILE_ERROR",
+                    "reconcileStuckOrders: unhandled error processing orderId=" + orderId
+                    + " err=" + orderEx.getMessage());
+            }
+        }
+
+    } catch (Exception e) {
+        logStore.error(SVC, traceId, "RECONCILE_STUCK_ORDERS_FATAL",
+            "reconcileStuckOrders: fatal error during reconciliation scan err=" + e.getMessage());
+    }
+
+    logStore.info(SVC, traceId, "reconcileStuckOrders: scan complete");
+}
 }
