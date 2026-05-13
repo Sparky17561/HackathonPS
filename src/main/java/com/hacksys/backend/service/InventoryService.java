@@ -68,66 +68,108 @@ public class InventoryService {
     /**
      * Reserve stock for an order.
      */
-    public boolean reserveStock(String productId, int quantity, String traceId) {
-        TraceContext.setService(SVC);
-        TraceContext.bindTrace(traceId);
-        MDC.put("product_id", productId);
+public boolean reserveStock(String productId, int quantity, String traceId) {
+    return reserveStock(productId, quantity, traceId, traceId + "-1");
+}
 
-        log.info("Attempting to reserve stock productId={} qty={}", productId, quantity);
-        logStore.info(SVC, traceId, "Stock reservation requested for " + productId + " qty=" + quantity);
+public boolean reserveStock(String productId, int quantity, String traceId, String idempotencyKey) {
+    TraceContext.setService(SVC);
+    TraceContext.bindTrace(traceId);
+    MDC.put("product_id", productId);
+    MDC.put("idempotency_key", idempotencyKey);
 
-        InventoryItem item = inventory.get(productId);
-        if (item == null) {
-            log.warn("Product not found in inventory productId={}", productId);
-            logStore.warn(SVC, traceId, "PRODUCT_NOT_FOUND",
-                    "Reservation failed — product not found: " + productId);
-            return false;
-        }
+    log.info("Attempting to reserve stock productId={} qty={} idempotencyKey={}", productId, quantity, idempotencyKey);
+    logStore.info(SVC, traceId, "Stock reservation requested for " + productId + " qty=" + quantity + " idempotencyKey=" + idempotencyKey);
 
-        if (shouldFail()) {
-            String[] codes = {"INV_TIMEOUT", "STORE_TIMEOUT", "WAREHOUSE_DELAY", "INV_SVC_TIMEOUT"};
-            String[] msgs  = {
-                "inv svc timeout — reservation incomplete prod=" + productId,
-                "store momentarily unavailable, hold not applied",
-                "warehouse feed delayed — stock not committed for " + productId,
-                "reservation timed out — retrying reserve op"
-            };
-            int pick = rng.nextInt(codes.length);
-            log.warn("inv svc timeout productId={}", productId);
-            logStore.warn(SVC, traceId, codes[pick], msgs[pick]);
-            throw new RuntimeException("Inventory store transient failure");
-        }
-
-        int current = item.getStock();
-        log.info("Current stock for {} = {}, requesting {}", productId, current, quantity);
-
-        if (current < quantity) {
-            String[] msgs = {
-                "insufficient stock — available=" + current + " requested=" + quantity + " sku=" + productId,
-                "stock check fail: have=" + current + " need=" + quantity,
-                "cannot reserve — stock level below threshold for " + productId
-            };
-            log.warn("Insufficient stock productId={} available={} requested={}", productId, current, quantity);
-            logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK", msgs[rng.nextInt(msgs.length)]);
-            return false;
-        }
-
-        try { Thread.sleep(10); } catch (InterruptedException ignored) {}
-
-        item.setStock(current - quantity);
-        item.setReservedStock(item.getReservedStock() + quantity);
-        item.setLastUpdated(Instant.now());
-
-        log.info("Stock reserved productId={} reserved={} remaining={}", productId, quantity, item.getStock());
-        if (rng.nextInt(10) < 8) {
-            logStore.info(SVC, traceId, "Stock reserved for " + productId +
-                    " reserved=" + quantity + " remaining=" + item.getStock());
-        } else {
-            logStore.info(SVC, traceId, "reservation ok sku=" + productId + " qty=" + quantity);
-        }
-
+    // Idempotency check â€” if already committed, return true immediately
+    if (committedReservations.containsKey(idempotencyKey)) {
+        log.info("Idempotent reservation detected idempotencyKey={} â€” returning committed result", idempotencyKey);
+        logStore.info(SVC, traceId, "Idempotent reservation replay for idempotencyKey=" + idempotencyKey);
         return true;
     }
+
+    InventoryItem item = inventory.get(productId);
+    if (item == null) {
+        log.warn("Product not found in inventory productId={}", productId);
+        logStore.warn(SVC, traceId, "PRODUCT_NOT_FOUND",
+                "Reservation failed â€” product not found: " + productId);
+        return false;
+    }
+
+    if (shouldFail()) {
+        String[] codes = {"INV_TIMEOUT", "STORE_TIMEOUT", "WAREHOUSE_DELAY", "INV_SVC_TIMEOUT"};
+        String[] msgs  = {
+            "inv svc timeout â€” reservation incomplete prod=" + productId,
+            "store momentarily unavailable, hold not applied",
+            "warehouse feed delayed â€” stock not committed for " + productId,
+            "reservation timed out â€” retrying reserve op"
+        };
+        int pick = rng.nextInt(codes.length);
+        log.warn("inv svc timeout productId={} idempotencyKey={}", productId, idempotencyKey);
+        logStore.warn(SVC, traceId, codes[pick], msgs[pick]);
+
+        // Reconciliation loop: up to 3 retries with exponential backoff
+        int maxReconcileAttempts = 3;
+        for (int attempt = 1; attempt <= maxReconcileAttempts; attempt++) {
+            long backoffMs = (long) Math.pow(2, attempt) * 200L;
+            log.info("Reconciliation attempt {}/{} for idempotencyKey={} backoffMs={}",
+                    attempt, maxReconcileAttempts, idempotencyKey, backoffMs);
+            logStore.info(SVC, traceId, "Reconciliation attempt " + attempt + " for idempotencyKey=" + idempotencyKey);
+            try { Thread.sleep(backoffMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+
+            ReservationStatus status = checkReservationStatus(idempotencyKey, traceId);
+            if (status == ReservationStatus.COMMITTED) {
+                log.info("Reconciliation confirmed COMMITTED for idempotencyKey={}", idempotencyKey);
+                logStore.info(SVC, traceId, "Reconciliation confirmed reservation committed idempotencyKey=" + idempotencyKey);
+                return true;
+            } else if (status == ReservationStatus.NOT_COMMITTED) {
+                log.info("Reconciliation confirmed NOT_COMMITTED for idempotencyKey={}", idempotencyKey);
+                logStore.info(SVC, traceId, "Reconciliation confirmed reservation not committed idempotencyKey=" + idempotencyKey);
+                return false;
+            }
+            // UNKNOWN â€” continue retrying
+        }
+
+        log.error("Reconciliation exhausted all attempts for idempotencyKey={} â€” propagating failure", idempotencyKey);
+        logStore.warn(SVC, traceId, "RECONCILE_EXHAUSTED",
+                "Could not determine reservation status after " + maxReconcileAttempts + " attempts for idempotencyKey=" + idempotencyKey);
+        throw new RuntimeException("Inventory store transient failure â€” reconciliation inconclusive for idempotencyKey=" + idempotencyKey);
+    }
+
+    int current = item.getStock();
+    log.info("Current stock for {} = {}, requesting {}", productId, current, quantity);
+
+    if (current < quantity) {
+        String[] msgs = {
+            "insufficient stock â€” available=" + current + " requested=" + quantity + " sku=" + productId,
+            "stock check fail: have=" + current + " need=" + quantity,
+            "cannot reserve â€” stock level below threshold for " + productId
+        };
+        log.warn("Insufficient stock productId={} available={} requested={}", productId, current, quantity);
+        logStore.warn(SVC, traceId, "INSUFFICIENT_STOCK", msgs[rng.nextInt(msgs.length)]);
+        return false;
+    }
+
+    try { Thread.sleep(10); } catch (InterruptedException ignored) {}
+
+    item.setStock(current - quantity);
+    item.setReservedStock(item.getReservedStock() + quantity);
+    item.setLastUpdated(Instant.now());
+
+    // Record committed reservation for idempotency and reconciliation
+    committedReservations.put(idempotencyKey, new ReservationRecord(productId, quantity, Instant.now()));
+
+    log.info("Stock reserved productId={} reserved={} remaining={} idempotencyKey={}",
+            productId, quantity, item.getStock(), idempotencyKey);
+    if (rng.nextInt(10) < 8) {
+        logStore.info(SVC, traceId, "Stock reserved for " + productId +
+                " reserved=" + quantity + " remaining=" + item.getStock());
+    } else {
+        logStore.info(SVC, traceId, "reservation ok sku=" + productId + " qty=" + quantity);
+    }
+
+    return true;
+}
 
     /**
      * Hard deduct (used by payment confirmation path).
@@ -285,4 +327,155 @@ public class InventoryService {
     private boolean shouldFail() {
         return Math.random() < failureRate;
     }
+
+
+/**
+ * Compensating transaction: restore previously reserved stock.
+ * Called when a downstream step (e.g. payment) fails after inventory was decremented.
+ */
+public boolean releaseReservation(String productId, int quantity, String traceId) {
+    TraceContext.setService(SVC);
+    TraceContext.bindTrace(traceId);
+    MDC.put("product_id", productId);
+
+    log.info("Releasing inventory reservation productId={} qty={}", productId, quantity);
+    logStore.info(SVC, traceId, "Inventory release requested for " + productId + " qty=" + quantity);
+
+    if (productId == null) {
+        log.error("Cannot release reservation â€” null productId");
+        logStore.error(SVC, traceId, "NULL_PRODUCT_ID", "releaseReservation called with null productId");
+        return false;
+    }
+
+    if (quantity <= 0) {
+        log.error("Invalid release quantity={} for productId={}", quantity, productId);
+        logStore.error(SVC, traceId, "INVALID_QUANTITY",
+                "Release rejected â€” quantity must be positive: qty=" + quantity + " sku=" + productId);
+        return false;
+    }
+
+    InventoryItem item = inventory.get(productId);
+    if (item == null) {
+        log.warn("Product not found during release productId={}", productId);
+        logStore.warn(SVC, traceId, "PRODUCT_NOT_FOUND",
+                "Release failed â€” product not found: " + productId);
+        return false;
+    }
+
+    int maxRetries = 10;
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+        int current = item.getStockRef().get();
+        int updated = current + quantity;
+        if (item.getStockRef().compareAndSet(current, updated)) {
+            log.info("Inventory released productId={} qty={} newStock={}", productId, quantity, updated);
+            logStore.info(SVC, traceId, "Stock restored for productId=" + productId
+                    + " qty=" + quantity + " newStock=" + updated);
+            return true;
+        }
+    }
+
+    log.error("Failed to release inventory after {} retries productId={}", maxRetries, productId);
+    logStore.error(SVC, traceId, "RELEASE_CAS_FAILED",
+            "CAS loop exhausted during release for productId=" + productId);
+    return false;
+}
+
+
+/**
+ * Enum representing the definitive status of a reservation identified by an idempotency key.
+ */
+public enum ReservationStatus {
+    COMMITTED, NOT_COMMITTED, UNKNOWN
+}
+
+/**
+ * Internal record of a committed reservation.
+ */
+private static class ReservationRecord {
+    final String productId;
+    final int quantity;
+    final Instant committedAt;
+    ReservationRecord(String productId, int quantity, Instant committedAt) {
+        this.productId = productId;
+        this.quantity = quantity;
+        this.committedAt = committedAt;
+    }
+}
+
+// Tracks committed reservations keyed by idempotency key
+private final ConcurrentHashMap<String, ReservationRecord> committedReservations = new ConcurrentHashMap<>();
+
+/**
+ * Query whether a reservation identified by the given idempotency key has committed.
+ * Returns COMMITTED, NOT_COMMITTED, or UNKNOWN (if the backend is still unreachable).
+ */
+public ReservationStatus checkReservationStatus(String idempotencyKey, String traceId) {
+    TraceContext.setService(SVC);
+    log.info("checkReservationStatus idempotencyKey={}", idempotencyKey);
+    logStore.info(SVC, traceId, "Checking reservation status for idempotencyKey=" + idempotencyKey);
+
+    if (committedReservations.containsKey(idempotencyKey)) {
+        log.info("Reservation COMMITTED for idempotencyKey={}", idempotencyKey);
+        logStore.info(SVC, traceId, "Reservation status=COMMITTED idempotencyKey=" + idempotencyKey);
+        return ReservationStatus.COMMITTED;
+    }
+
+    // In a real system this would query a durable backend/outbox.
+    // Here, absence from the committed map means not committed.
+    log.info("Reservation NOT_COMMITTED for idempotencyKey={}", idempotencyKey);
+    logStore.info(SVC, traceId, "Reservation status=NOT_COMMITTED idempotencyKey=" + idempotencyKey);
+    return ReservationStatus.NOT_COMMITTED;
+}
+
+/**
+ * Returns true if a reservation for the given idempotency key is committed.
+ */
+public boolean isReservationCommitted(String idempotencyKey) {
+    return committedReservations.containsKey(idempotencyKey);
+}
+
+
+/**
+ * Compensating action: release a committed reservation identified by idempotency key.
+ * Restores stock levels if the reservation was committed. No-op if not committed.
+ *
+ * @param idempotencyKey the idempotency key used when the reservation was made
+ * @param traceId        the trace ID for logging
+ * @return true if a reservation was found and released, false if no committed reservation existed
+ */
+public boolean releaseReservation(String idempotencyKey, String traceId) {
+    TraceContext.setService(SVC);
+    TraceContext.bindTrace(traceId);
+    log.info("releaseReservation called idempotencyKey={}", idempotencyKey);
+    logStore.info(SVC, traceId, "Compensation: releasing reservation for idempotencyKey=" + idempotencyKey);
+
+    ReservationRecord record = committedReservations.remove(idempotencyKey);
+    if (record == null) {
+        log.info("No committed reservation found for idempotencyKey={} â€” no-op", idempotencyKey);
+        logStore.info(SVC, traceId, "releaseReservation no-op: no committed reservation for idempotencyKey=" + idempotencyKey);
+        return false;
+    }
+
+    InventoryItem item = inventory.get(record.productId);
+    if (item == null) {
+        log.warn("releaseReservation: product not found in inventory productId={} idempotencyKey={}",
+                record.productId, idempotencyKey);
+        logStore.warn(SVC, traceId, "RELEASE_PRODUCT_NOT_FOUND",
+                "Cannot restore stock â€” product not found: " + record.productId + " idempotencyKey=" + idempotencyKey);
+        return false;
+    }
+
+    synchronized (item) {
+        item.setStock(item.getStock() + record.quantity);
+        int newReserved = Math.max(0, item.getReservedStock() - record.quantity);
+        item.setReservedStock(newReserved);
+        item.setLastUpdated(Instant.now());
+    }
+
+    log.info("Reservation released productId={} qty={} idempotencyKey={} restoredStock={}",
+            record.productId, record.quantity, idempotencyKey, item.getStock());
+    logStore.info(SVC, traceId, "Reservation released and stock restored for productId=" + record.productId
+            + " qty=" + record.quantity + " idempotencyKey=" + idempotencyKey);
+    return true;
+}
 }
