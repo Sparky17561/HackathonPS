@@ -39,7 +39,32 @@ public class Order {
     public String getUserId() { return userId; }
     public void setUserId(String userId) { this.userId = userId; }
 
-    public Status getStatus() { return status.get(); }
+public Status getStatus() { return status.get(); }
+
+/**
+ * Order lifecycle status enum.
+ *
+ * Terminal states:  CONFIRMED, CANCELLED, FAILED
+ * Intermediate/stuck states: PENDING, RESERVATION_UNCERTAIN, RESERVATION_FAILED
+ */
+public enum Status {
+    /** Order created, awaiting inventory reservation. */
+    PENDING,
+    /** Inventory reservation call timed out â€” outcome unknown; sweeper will reconcile. */
+    RESERVATION_UNCERTAIN,
+    /** Inventory reservation definitively failed (insufficient stock or hard error). */
+    RESERVATION_FAILED,
+    /** Inventory reserved; awaiting payment processing. */
+    RESERVED,
+    /** Payment processing in progress. */
+    PAYMENT_PENDING,
+    /** Order fully confirmed â€” inventory committed and payment captured. */
+    CONFIRMED,
+    /** Order cancelled â€” any held inventory has been released. */
+    CANCELLED,
+    /** Order failed due to an unrecoverable error. */
+    FAILED
+}
     public void setStatus(Status s) {
         this.status.set(s);
         this.updatedAt = Instant.now();

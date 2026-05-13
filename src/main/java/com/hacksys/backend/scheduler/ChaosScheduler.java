@@ -425,4 +425,179 @@ public class ChaosScheduler {
             }
         }
     }
+
+
+/**
+ * Stuck-order sweeper â€” runs every 5 minutes.
+ * Finds orders in non-terminal states older than 10 minutes,
+ * triggers compensation (payment reversal + inventory release),
+ * transitions them to FAILED, and fires an on-call alert.
+ */
+@Scheduled(cron = "0 */5 * * * *")
+public void sweepStuckOrders() {
+    String traceId = "sweep-" + UUID.randomUUID().toString().substring(0, 8);
+    log.warn("[SWEEPER] Starting stuck-order sweep traceId={}", traceId);
+    logStore.warn(SVC, traceId, "SWEEPER_START", "Stuck-order sweeper initiated");
+
+    try {
+        List<Order> stuckOrders = orderService.getStuckOrders(10);
+        if (stuckOrders == null || stuckOrders.isEmpty()) {
+            logStore.info(SVC, traceId, "SWEEPER_NO_STUCK_ORDERS", "No stuck orders found in this sweep cycle");
+            return;
+        }
+
+        log.warn("[SWEEPER] Found {} stuck order(s) traceId={}", stuckOrders.size(), traceId);
+        logStore.warn(SVC, traceId, "SWEEPER_STUCK_FOUND",
+                "Stuck orders detected count=" + stuckOrders.size());
+
+        for (Order order : stuckOrders) {
+            String orderId = order.getId();
+            String sweepTrace = traceId + "-" + orderId.substring(0, Math.min(8, orderId.length()));
+            try {
+                log.warn("[SWEEPER] Compensating stuck orderId={} status={} createdAt={}",
+                        orderId, order.getStatus(), order.getCreatedAt());
+                logStore.warn(SVC, sweepTrace, "SWEEPER_COMPENSATING",
+                        "Compensating stuck orderId=" + orderId +
+                        " status=" + order.getStatus() +
+                        " createdAt=" + order.getCreatedAt());
+
+                // Trigger compensation for each item in the stuck order
+                if (order.getItems() != null) {
+                    for (Order.OrderItem item : order.getItems()) {
+                        if (item.getProductId() != null) {
+                            orderService.compensateFailedReservation(
+                                    orderId, item.getProductId(), item.getQuantity(), sweepTrace);
+                        }
+                    }
+                } else {
+                    // No items â€” just fail the order
+                    orderService.compensateFailedReservation(orderId, null, 0, sweepTrace);
+                }
+
+                log.warn("[ON-CALL ALERT] Stuck order remediated orderId={} â€” verify state manually", orderId);
+                logStore.error(SVC, sweepTrace, "ON_CALL_ALERT",
+                        "[SWEEPER] Stuck order remediated orderId=" + orderId +
+                        " â€” manual verification recommended");
+
+            } catch (Exception e) {
+                log.error("[SWEEPER] Compensation failed for orderId={}: {}", orderId, e.getMessage(), e);
+                logStore.error(SVC, sweepTrace, "SWEEPER_COMPENSATION_FAILED",
+                        "Compensation error for orderId=" + orderId + " err=" + e.getMessage());
+            }
+        }
+    } catch (Exception e) {
+        log.error("[SWEEPER] Sweep cycle failed: {}", e.getMessage(), e);
+        logStore.error(SVC, traceId, "SWEEPER_CYCLE_ERROR",
+                "Stuck-order sweep cycle encountered error: " + e.getMessage());
+    }
+
+    logStore.info(SVC, traceId, "SWEEPER_END", "Stuck-order sweep cycle complete");
+}
+
+
+/**
+ * Stuck-order sweeper â€” runs every 5 minutes, queries for orders in intermediate/uncertain
+ * states older than 3 minutes, attempts saga compensation, and alerts on-call if resolution fails.
+ */
+@Scheduled(cron = "0 */5 * * * *", zone = "UTC")
+public void stuckOrderSweeper() {
+    String traceId = "sweeper-" + UUID.randomUUID().toString().substring(0, 8);
+    long stuckThresholdMs = 3L * 60 * 1000; // 3 minutes
+    long now = System.currentTimeMillis();
+
+    logStore.info(SVC, traceId, "stuckOrderSweeper: starting sweep thresholdMs=" + stuckThresholdMs);
+    log.info("stuckOrderSweeper: starting sweep traceId={}", traceId);
+
+    List<Order> stuckOrders;
+    try {
+        stuckOrders = orderService.getOrdersInIntermediateStates(traceId);
+    } catch (Exception e) {
+        logStore.error(SVC, traceId, "SWEEPER_QUERY_FAILED",
+                "stuckOrderSweeper: failed to query intermediate-state orders: " + e.getMessage());
+        log.error("stuckOrderSweeper: failed to query intermediate-state orders traceId={}", traceId, e);
+        return;
+    }
+
+    if (stuckOrders == null || stuckOrders.isEmpty()) {
+        logStore.info(SVC, traceId, "stuckOrderSweeper: no stuck orders found");
+        log.info("stuckOrderSweeper: no stuck orders found traceId={}", traceId);
+        return;
+    }
+
+    int resolved = 0;
+    int failed = 0;
+    List<String> unresolvableOrderIds = new ArrayList<>();
+
+    for (Order order : stuckOrders) {
+        long ageMs = now - order.getCreatedAt();
+        if (ageMs < stuckThresholdMs) {
+            log.debug("stuckOrderSweeper: order {} age={}ms below threshold, skipping", order.getId(), ageMs);
+            continue;
+        }
+
+        log.warn("stuckOrderSweeper: found stuck order orderId={} status={} ageMs={}",
+                order.getId(), order.getStatus(), ageMs);
+        logStore.warn(SVC, traceId, "STUCK_ORDER_DETECTED",
+                "stuckOrderSweeper: stuck order detected orderId=" + order.getId()
+                        + " status=" + order.getStatus() + " ageMs=" + ageMs);
+
+        boolean compensated = false;
+        try {
+            // Attempt saga compensation: cancel the order and release any held inventory
+            Order.Status currentStatus = order.getStatus();
+            if (currentStatus == Order.Status.RESERVATION_UNCERTAIN
+                    || currentStatus == Order.Status.RESERVATION_FAILED
+                    || currentStatus == Order.Status.PENDING) {
+
+                // Attempt to cancel reservation for each item in the order
+                for (Order.OrderItem item : order.getItems()) {
+                    String idempotencyKey = order.getId() + ":" + item.getProductId() + ":cancel";
+                    boolean cancelResult = inventoryService.cancelReservation(
+                            order.getId(), item.getProductId(), idempotencyKey, traceId);
+                    if (!cancelResult) {
+                        logStore.warn(SVC, traceId, "SWEEPER_CANCEL_UNCERTAIN",
+                                "stuckOrderSweeper: cancelReservation uncertain orderId=" + order.getId()
+                                        + " productId=" + item.getProductId());
+                    }
+                }
+
+                // Cancel the order itself
+                orderService.cancelOrder(order.getId(), traceId);
+                logStore.info(SVC, traceId,
+                        "stuckOrderSweeper: order cancelled via compensation orderId=" + order.getId());
+                log.info("stuckOrderSweeper: order cancelled via compensation orderId={}", order.getId());
+                compensated = true;
+                resolved++;
+            } else {
+                log.info("stuckOrderSweeper: order {} in status {} â€” no compensation needed",
+                        order.getId(), currentStatus);
+                compensated = true;
+                resolved++;
+            }
+        } catch (Exception e) {
+            logStore.error(SVC, traceId, "SWEEPER_COMPENSATION_FAILED",
+                    "stuckOrderSweeper: compensation failed orderId=" + order.getId()
+                            + " error=" + e.getMessage());
+            log.error("stuckOrderSweeper: compensation failed orderId={}", order.getId(), e);
+        }
+
+        if (!compensated) {
+            failed++;
+            unresolvableOrderIds.add(order.getId());
+        }
+    }
+
+    logStore.info(SVC, traceId,
+            "stuckOrderSweeper: sweep complete resolved=" + resolved + " failed=" + failed);
+    log.info("stuckOrderSweeper: sweep complete resolved={} failed={} traceId={}", resolved, failed, traceId);
+
+    if (failed > 0) {
+        // Alert on-call: log at ERROR level with ONCALL_ALERT code for monitoring/alerting pickup
+        logStore.error(SVC, traceId, "ONCALL_ALERT",
+                "stuckOrderSweeper: " + failed + " order(s) could not be resolved automatically "
+                        + "â€” manual intervention required. orderIds=" + unresolvableOrderIds);
+        log.error("[ONCALL_ALERT] stuckOrderSweeper: {} unresolvable stuck orders require manual intervention: {}",
+                failed, unresolvableOrderIds);
+    }
+}
 }
